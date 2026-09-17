@@ -604,7 +604,7 @@ Audit trail for all critical actions.
 ```sql
 CREATE TABLE audit_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  restaurant_id UUID REFERENCES restaurants(id) ON DELETE CASCADE,  -- nullable: see note below
+  restaurant_id UUID,  -- nullable, and NOT a foreign key: see note below
   
   action ENUM(
     'order_placed', 'order_cancelled', 'menu_updated',
@@ -630,6 +630,8 @@ CREATE INDEX idx_audit_platform ON audit_log(action) WHERE restaurant_id IS NULL
 ```
 
 Note: `restaurant_id` was originally `NOT NULL` — migration 005 (2026-09-17) relaxed it. Adding `platform_admins` (table 21) meant a denied System Admin check has no single restaurant to attach to; `NULL` here specifically means "a platform-level action, not scoped to any restaurant," not "unknown."
+
+Note: `restaurant_id` was originally a hard `REFERENCES restaurants(id) ON DELETE CASCADE` too — migration 011 (2026-09-17) dropped that FK, for two reasons found via a live Postgres error log: (1) `ON DELETE CASCADE` meant deleting a restaurant destroyed its own audit history along with it, the opposite of what an audit trail is for; (2) `authorize()`'s denial path (`middleware/authorize.js`) logs every failed authorization attempt using whatever `restaurantId` is in the request URL — including a well-formed UUID that doesn't correspond to a real restaurant, exactly the shape of a tenant-enumeration probe. That write failed the FK check every time, and `logAudit()` (`audit.js`) deliberately swallows its own errors so a logging bug can never break a real request — meaning this entire category of denial was invisible everywhere except ephemeral console output, never in this table, where Part 5 requires it to be. `restaurant_id` is now a soft reference: still useful for joins when it happens to be a real, live restaurant, but no longer enforced or cascaded.
 
 ---
 

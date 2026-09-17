@@ -1,0 +1,26 @@
+-- 011_audit_log_soft_restaurant_reference.sql
+--
+-- audit_log.restaurant_id (migration 001) has always been a hard
+-- REFERENCES restaurants(id) ON DELETE CASCADE. Two real problems with
+-- that, found 2026-09-17 while reviewing live Postgres error logs:
+--
+-- 1. ON DELETE CASCADE means deleting a restaurant destroys its own
+--    audit history along with it — the opposite of what an audit trail
+--    is for (you generally want to still see what happened even after
+--    the thing it happened to is gone).
+-- 2. Any authorize() denial (middleware/authorize.js) against a
+--    restaurant_id that's a well-formed UUID but doesn't correspond to
+--    a real restaurant — exactly the shape of a tenant-enumeration
+--    probe — fails this FK constraint on write. logAudit() (audit.js)
+--    deliberately swallows that failure so a logging bug can never
+--    break a real request, which is correct in isolation, but it means
+--    this specific, security-relevant category of denial was invisible
+--    everywhere except ephemeral console output, never in the durable,
+--    queryable audit_log table SNAPORDER_AUTHORIZATION.md Part 5
+--    requires it to be in.
+--
+-- Standard practice for audit tables: the reference should be soft
+-- (still useful for joins when the id happens to be a real, live
+-- restaurant), not enforced. Column and index are unchanged — only the
+-- constraint is dropped.
+ALTER TABLE audit_log DROP CONSTRAINT audit_log_restaurant_id_fkey;

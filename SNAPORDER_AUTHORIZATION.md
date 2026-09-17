@@ -290,6 +290,8 @@ Verified live against real data (register two restaurants, cross-restaurant acce
 
 Every DENIED authorization decision, and every state-changing ALLOWED one, should be recorded in the existing `audit_log` table (`SNAPORDER_DATABASE_SCHEMA.md`). No new table needed — this uses what's already there. **Denials are implemented:** every `authorize()` rejection writes a row via `backend/src/audit.js`'s `logAudit()` (actor, restaurant, the permission checked, why it failed, the request path) — verified live, see Part 4. **Allowed-action logging for specific sensitive operations (a refund, a staff removal) is not automatic** — `logAudit()` is exported for any route handler that wants to call it explicitly; none do yet, since none of those routes exist.
 
+**Real gap found and fixed 2026-09-17 (via a live Postgres error log, not a report):** `audit_log.restaurant_id` used to be a hard `REFERENCES restaurants(id) ON DELETE CASCADE` (`SNAPORDER_DATABASE_SCHEMA.md` table 17). A denial against a well-formed-but-nonexistent `restaurantId` — exactly the shape of a tenant-enumeration probe — failed that FK check on write, and `logAudit()` deliberately swallows its own errors so a logging bug can never break a real request. Net effect: this entire category of denial was invisible everywhere except ephemeral console output, never actually reaching this table. Migration 011 dropped the FK (soft reference now, not enforced or cascaded) — verified live: the same probe now correctly produces both the `403` response and a durable `audit_log` row, with a regression test (`backend/tests/integration/auditLog.test.js`) covering it going forward.
+
 ```sql
 INSERT INTO audit_log (restaurant_id, action, actor_type, actor_id, resource_type, resource_id, changes, ip_address)
 VALUES ($1, 'authz_denied', 'staff', $2, 'menu_meal', $3, '{"permission": "edit_menu", "reason": "wrong_restaurant"}', $4);
@@ -332,7 +334,8 @@ A leaked Waiter token exposes one restaurant's order queue. A leaked System Admi
 
 ---
 
-**Doc version:** 1.8 — added `manage_tables` permission (Part 1, QR code generation) and implemented `edit_menu`/`view_restaurant_analytics`/`pay_own_order` for real (meal creation, daily analytics, Paystack payments); addressed a role-naming conflict ("Chef"/"Cashier") directly rather than forking a second role system
+**Doc version:** 1.9 — fixed a real audit-logging gap (Part 5): `audit_log.restaurant_id`'s hard FK constraint silently dropped denial records for any nonexistent-restaurant probe; now a soft reference (migration 011)
+**Previous:** 1.8 — added `manage_tables` permission (Part 1, QR code generation) and implemented `edit_menu`/`view_restaurant_analytics`/`pay_own_order` for real (meal creation, daily analytics, Paystack payments); addressed a role-naming conflict ("Chef"/"Cashier") directly rather than forking a second role system
 **Previous:** 1.7 — added `assign_table` permission (Part 1) and its implementation (`backend/src/routes/tables.js`, `table_assignments`), the first permission added to the matrix after the fact rather than part of the original design
 **Status:** Design specification, ready for implementation
 **Related:** `SNAPORDER_DATABASE_SCHEMA.md` (schema this model extends), `SNAPORDER_API_CONTRACTS.md` (endpoints this protects), `backend/src/auth.js` (JWT layer this builds on)
