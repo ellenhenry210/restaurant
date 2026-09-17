@@ -66,6 +66,58 @@ changed the mapping.
 | `docker-compose down` | Stops them (data persists in Docker volumes) |
 | `docker-compose logs -f` | Tails logs from all three services |
 
+## Testing
+
+```bash
+cd backend
+npm test
+```
+
+Self-contained: `tests/globalSetup.js` creates a separate `snaporder_test`
+database on the same local Postgres (never the dev one — tests truncate
+tables between runs) and applies every migration to it automatically, the
+first time you run `npm test`. Requires `docker-compose up -d` to already
+be running (or any reachable Postgres matching `backend/.env.test`).
+
+Unit tests (`tests/unit/`) cover pure logic with no database — JWT
+issuance/verification, the Haversine proximity math, the RBAC permission
+matrix, Paystack webhook signature verification. Integration tests
+(`tests/integration/`) exercise real HTTP requests against the actual
+Express app (`backend/src/app.js`) with `supertest`, backed by the real
+test database — this is where model+controller+route behavior is
+actually verified, including RBAC denials, the allergen removal-policy
+engine, order state transitions, and the Paystack payment/webhook flow
+(the Paystack API call itself is mocked; signature verification is not).
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`: lint both
+apps, run the backend test suite against a real Postgres service
+container, `npm audit` both apps (fails on high/critical), build both
+Docker images, and build the frontend for production. On a push to
+`main`, both Docker images are also published to GitHub Container
+Registry (`ghcr.io`) using the repo's own token — no extra secrets
+needed. **Not built yet:** actually deploying those published images
+anywhere — there's no hosting target configured. See `known-gaps.md`
+(session memory) for the full list of what's next.
+
+## Production Docker setup
+
+`docker-compose.prod.yml` builds and runs the real application images
+(`backend/Dockerfile`, `frontend/Dockerfile`) alongside Postgres/Redis/
+RabbitMQ — unlike the dev `docker-compose.yml`, which only runs those
+three and expects `npm run dev` for the apps themselves. Copy
+`.env.prod.example` to `.env` in the repo root, fill in real secrets,
+then:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+Only the backend (3000) and frontend (80) ports are published to the
+host — Postgres/Redis/RabbitMQ stay inside the Docker network, unlike
+the dev compose file (which publishes all three for local tooling).
+
 ## Status
 
 Early development. See `SNAPORDER_AUTHORIZATION.md` and the other
