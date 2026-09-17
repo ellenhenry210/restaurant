@@ -15,6 +15,8 @@ import menuRoutes from './routes/menus.js';
 import orderRoutes from './routes/orders.js';
 import restaurantOrderRoutes from './routes/restaurantOrders.js';
 import tableRoutes from './routes/tables.js';
+import paymentRoutes from './routes/payments.js';
+import qrRoutes from './routes/qr.js';
 
 dotenv.config();
 
@@ -24,6 +26,13 @@ const PORT = process.env.PORT || 3000;
 // Applied before express.json() so an over-limit request is rejected
 // cheaply, without paying the cost of parsing its body first.
 app.use(generalLimiter);
+
+// Mounted BEFORE express.json(): the webhook handler verifies Paystack's
+// HMAC signature against the exact raw request bytes (routes/payments.js
+// parses this one route's body with express.raw(), not JSON) — parsing
+// to JSON first and re-serializing later would change the bytes and
+// break every legitimate signature.
+app.use('/v1/payments', paymentRoutes);
 
 app.use(express.json());
 
@@ -80,6 +89,11 @@ app.use('/v1/restaurants/:restaurantId/orders', restaurantOrderRoutes);
 // Table-to-staff assignment ("who's serving this table") — behind
 // authenticate + authorize(). See routes/tables.js.
 app.use('/v1/restaurants/:restaurantId/tables', tableRoutes);
+
+// Table QR code generation — behind authenticate + authorize(). See
+// routes/qr.js for why this is its own top-level namespace instead of
+// nesting under the tables mount above.
+app.use('/v1/qr', qrRoutes);
 
 // 404 for anything that didn't match a route above — must come after
 // every real route. Without this, an unmatched path (a typo, a

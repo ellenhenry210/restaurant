@@ -78,6 +78,63 @@ export async function findIngredientsByMealId(mealId) {
 }
 
 /**
+ * A meal_categories row, only if it belongs to this restaurant (via its
+ * menu) — the check that stops a manager creating a meal under a
+ * category that belongs to a DIFFERENT restaurant.
+ * @returns {Promise<{id}|null>}
+ */
+export async function findCategoryForRestaurant(categoryId, restaurantId, executor = pool) {
+  const result = await executor.query(
+    `SELECT mc.id
+     FROM meal_categories mc
+     JOIN menus m ON m.id = mc.menu_id
+     WHERE mc.id = $1 AND m.restaurant_id = $2`,
+    [categoryId, restaurantId]
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * Insert a new meal. Previously only ever seeded directly via SQL — see
+ * SNAPORDER_API_CONTRACTS.md's Menu section, now updated to reflect this.
+ * @returns {Promise<object>} the inserted row
+ */
+export async function insertMeal(data, executor = pool) {
+  const result = await executor.query(
+    `INSERT INTO meals (
+       category_id, restaurant_id, name, description, image_url, base_price,
+       calories, protein_grams, carbs_grams, fat_grams, fiber_grams, sodium_mg,
+       is_vegan, is_vegetarian, is_gluten_free, is_low_calorie, is_high_protein,
+       is_available, estimated_prep_time_minutes
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+     RETURNING *`,
+    [
+      data.categoryId,
+      data.restaurantId,
+      data.name,
+      data.description ?? null,
+      data.imageUrl ?? null,
+      data.basePrice,
+      data.calories ?? null,
+      data.proteinGrams ?? null,
+      data.carbsGrams ?? null,
+      data.fatGrams ?? null,
+      data.fiberGrams ?? null,
+      data.sodiumMg ?? null,
+      data.isVegan ?? false,
+      data.isVegetarian ?? false,
+      data.isGlutenFree ?? false,
+      data.isLowCalorie ?? false,
+      data.isHighProtein ?? false,
+      data.isAvailable ?? true,
+      data.estimatedPrepTimeMinutes ?? null,
+    ]
+  );
+  return result.rows[0];
+}
+
+/**
  * Fetch a meal's available addons.
  * @param {string} mealId
  * @returns {Promise<object[]>}

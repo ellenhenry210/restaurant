@@ -56,6 +56,77 @@ export async function getMeal(req, res) {
   }
 }
 
+function validateCreateMealInput(body) {
+  const errors = [];
+  if (!body.category_id || typeof body.category_id !== 'string') {
+    errors.push({ field: 'category_id', reason: 'required' });
+  }
+  if (!body.name || typeof body.name !== 'string') {
+    errors.push({ field: 'name', reason: 'required' });
+  }
+  if (typeof body.base_price !== 'number' || body.base_price <= 0) {
+    errors.push({ field: 'base_price', reason: 'must be a positive number' });
+  }
+  return errors;
+}
+
+// ---------------------------------------------------------------------
+// POST /restaurants/:restaurantId/meals — behind edit_menu (manager/
+// owner/system_admin). Previously not implemented at all: menu/meal data
+// was seeded directly via SQL — a real, already-flagged gap, not a
+// duplicate of anything.
+// ---------------------------------------------------------------------
+export async function createMeal(req, res) {
+  const errors = validateCreateMealInput(req.body ?? {});
+  if (errors.length > 0) {
+    return res.status(400).json({
+      error: { code: 'INVALID_REQUEST', message: 'One or more fields are invalid', details: errors },
+    });
+  }
+
+  const { restaurantId } = req.params;
+  const body = req.body;
+
+  try {
+    const category = await menuModel.findCategoryForRestaurant(body.category_id, restaurantId);
+    if (!category) {
+      return res.status(400).json({
+        error: { code: 'INVALID_REQUEST', message: 'category_id does not belong to a menu at this restaurant' },
+      });
+    }
+
+    const meal = await menuModel.insertMeal({
+      categoryId: body.category_id,
+      restaurantId,
+      name: body.name,
+      description: body.description,
+      imageUrl: body.image_url,
+      basePrice: body.base_price,
+      calories: body.calories,
+      proteinGrams: body.protein_grams,
+      carbsGrams: body.carbs_grams,
+      fatGrams: body.fat_grams,
+      fiberGrams: body.fiber_grams,
+      sodiumMg: body.sodium_mg,
+      isVegan: body.is_vegan,
+      isVegetarian: body.is_vegetarian,
+      isGlutenFree: body.is_gluten_free,
+      isLowCalorie: body.is_low_calorie,
+      isHighProtein: body.is_high_protein,
+      isAvailable: body.is_available,
+      estimatedPrepTimeMinutes: body.estimated_prep_time_minutes,
+    });
+
+    res.status(201).json(meal);
+  } catch (err) {
+    if (err.code === '22P02') {
+      return res.status(400).json({ error: { code: 'INVALID_REQUEST', message: 'Invalid category_id' } });
+    }
+    console.error('POST /restaurants/:restaurantId/meals: failed:', err.message);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to create meal' } });
+  }
+}
+
 // ---------------------------------------------------------------------
 // GET /meals/:id/ingredients — the same ingredient join as above, on its
 // own. Genuinely redundant with the embedded list in getMeal() for a

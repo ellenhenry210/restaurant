@@ -253,8 +253,23 @@ Just the ingredient list from the endpoint above, as its own lighter-weight fetc
 
 ---
 
-### POST `/restaurants/{restaurantId}/menus/{menuId}/meals`
-Create a new meal (restaurant admin only). **Not implemented** — menu/meal data is currently seeded directly via SQL; no write endpoint exists yet. Kept here as the design target for when one is built.
+### POST `/v1/restaurants/{restaurantId}/meals`
+Create a new meal. Implemented (2026-09-17) — `backend/src/controllers/menuController.js`, behind `authenticate` + `authorize('edit_menu')` (manager/owner/system_admin). **Supersedes** the earlier `POST /restaurants/{restaurantId}/menus/{menuId}/meals` design-target path above — the real route takes `category_id` in the body instead of `menuId` in the URL, since a meal belongs to a category, not directly to a menu.
+
+**Request:**
+```json
+{
+  "category_id": "uuid",
+  "name": "Suya Skewers",
+  "description": "Grilled beef skewers, pepper-spiced",
+  "base_price": 2500,
+  "calories": 320,
+  "is_high_protein": true
+}
+```
+`category_id`, `name`, `base_price` (positive number) are required; every other field is optional. `category_id` must belong to a menu at `restaurantId` — a category from a different restaurant is rejected with `400`, not silently attached.
+
+**Response (201):** the inserted meal row (same shape as `GET /v1/meals/{id}` minus the joined `category_name`/`ingredients`/`addons`).
 
 ---
 
@@ -522,6 +537,49 @@ End the current assignment, if any — not an error if there wasn't one.
 
 ---
 
+## Payments
+
+Implemented (2026-09-17) — `backend/src/paystack.js`, `backend/src/controllers/paymentController.js`, `backend/src/routes/{orders,payments}.js`. Paystack's REST API is called directly via `fetch`, not the `paystack`/`paystack-js` npm packages — both were removed from this project earlier (critical vulnerabilities, `npm audit`); a handful of plain HTTP calls isn't worth a dependency. `payment_transactions` (migration 010) is the full history of every attempt; `orders.payment_status`/`payment_reference` (migration 001) remain the single current-state fields, updated by the webhook below.
+
+### POST `/v1/orders/{orderId}/payments/initialize`
+Start a Paystack checkout for an order the guest already placed. Behind `authenticateGuest`, same table-based ownership check as `GET /v1/orders/{id}` — a guest can only pay for an order at their own table.
+
+Paystack requires an `email` field; guests only ever provide a phone number (`guest_profiles`), so a synthesized address (`<phone>@guest.snaporder.app`) is sent — never actually mailed to, just satisfies the required field. Amount charged is `total_amount + tip_amount` (the `grand_total` concept from the Orders section above), converted to kobo.
+
+**Request:** `{ "callback_url": "https://..." }` — optional; Paystack falls back to the account's dashboard-configured default when omitted (no frontend is deployed yet to redirect back to).
+
+**Response (201):**
+```json
+{ "reference": "snap_...", "authorization_url": "https://checkout.paystack.com/...", "amount": "3937.50", "currency": "NGN", "status": "pending" }
+```
+**Response (403)** if the order isn't at the caller's table. **Response (409)** if `payment_status` is already `completed`.
+
+---
+
+### POST `/v1/payments/webhook`
+Paystack calls this directly — no guest/staff session at all. The HMAC-SHA512 signature (`x-paystack-signature` header, verified against `PAYSTACK_WEBHOOK_SECRET`) **is** the authentication; there is no other check. Mounted in `index.js` with `express.raw()` **before** the app-wide `express.json()`, since the signature must be verified against the exact raw request bytes — re-parsing to JSON first would produce a different hash and reject every real webhook.
+
+On a `charge.success`/`charge.failed` event matching a known `reference`, updates that `payment_transactions` row and, on success, sets `orders.payment_status = 'completed'` — one DB transaction, so a crash mid-update can't leave the two out of sync. Always acknowledges `200` once the signature is valid (Paystack retries on non-2xx; an event this endpoint doesn't act on is still acknowledged, not retried forever). An **invalid signature is rejected with `401`** and logged — the one case that isn't acknowledged.
+
+---
+
+## QR Codes
+
+Implemented (2026-09-17) — `backend/src/models/qrModel.js`, `backend/src/controllers/qrController.js`, `backend/src/routes/qr.js`. Requested as `GET /api/qr/{restaurantId}/{tableNumber}` linking to `https://snaporder.app/?r={restaurantId}&t={tableNumber}` — built as `GET /v1/qr/{restaurantId}/{tableNumber}` (this project's established `/v1` versioning, not `/api`) encoding a **different** URL, deliberately: see below.
+
+### GET `/v1/qr/{restaurantId}/{tableNumber}`
+Returns a PNG QR code image for a table, generated on the fly (no image storage/CDN is configured yet — `AWS_S3_*` in `.env.example` are still placeholders — so nothing is cached as a hosted file). Behind `authenticate` + `authorize('manage_tables')` (manager/owner/system_admin, new permission — see `SNAPORDER_AUTHORIZATION.md` Part 1) — this is a staff setup/printing action, not guest-facing.
+
+**Deliberate deviation from the literal request:** the QR encodes `https://snaporder.app/scan?code={tables.qr_code_unique_id}` (the same random, unguessable per-table token migration 001 already defined, and the target of the tested `POST /v1/tables/{qrCodeId}/scan` flow) — **not** `?r={restaurantId}&t={tableNumber}`. Table numbers are small sequential integers; encoding one directly in the guest-facing link would make every other table at a restaurant trivially guessable by incrementing `t`. `restaurantId`/`tableNumber` stay in this endpoint's own URL (fine — it's staff-only, used to look up and print a table's code), but what the QR image itself points guests to uses the opaque token instead.
+
+The resulting link is also saved to `tables.qr_code_url` ("store QR metadata in database") — a cheap idempotent write, since it's deterministic from the table's own stable `qr_code_unique_id`, not a growing history.
+
+**Response:** `Content-Type: image/png`, 400×400 PNG body. **Response (404)** if no such table at that restaurant.
+
+**Not built:** the frontend side ("scan QR → pre-fill restaurant & table") — no frontend exists yet in this project beyond the Vite starter template, so there's nothing to wire this into yet.
+
+---
+
 ## Guest Health Profiles
 
 ### POST `/guest-profiles`
@@ -641,17 +699,18 @@ Restaurant response to review.
 
 ## Analytics Dashboard
 
-### GET `/restaurants/{restaurantId}/analytics/daily`
-Daily metrics for restaurant dashboard.
+### GET `/v1/restaurants/{restaurantId}/analytics/daily`
+Implemented (2026-09-17) — `backend/src/models/analyticsModel.js`, `backend/src/controllers/analyticsController.js`. Behind `authenticate` + `authorize('view_restaurant_analytics')` — **manager/owner/system_admin** per the existing permission matrix. (Requested as "owner only"; built against the already-tested matrix instead of narrowing it for this one endpoint, since a manager legitimately needs to see how their own shift/day performed too.) Cancelled orders/items are excluded from every figure — a cancelled order was never actually served.
 
 **Query Params:**
 - `date=2025-09-16` — Optional, defaults to today
-- `days=7` — Last N days
+- `days=7` — Widens the window to `[date, date+days)`. **Not built:** a per-day breakdown across that window (that's the still-unbuilt `/analytics/revenue` endpoint below) — `days>1` here returns one aggregate over the whole range.
 
 **Response (200):**
 ```json
 {
   "date": "2025-09-16",
+  "days": 1,
   "metrics": {
     "total_orders": 42,
     "total_revenue": 142500,

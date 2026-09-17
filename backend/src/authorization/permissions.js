@@ -76,6 +76,11 @@ const PERMISSIONS = [
   // Manager-level action, not something a Waiter or Kitchen Staff
   // member grants themselves.
   { key: 'assign_table', roles: ['manager', 'owner', 'system_admin'] },
+  // Also not in the original Part 1 matrix — added 2026-09-17 for QR
+  // code generation (routes/qr.js). Printing/regenerating a table's QR
+  // is a setup action, same tier as assign_table, not something a
+  // Waiter or Kitchen Staff member does themselves.
+  { key: 'manage_tables', roles: ['manager', 'owner', 'system_admin'] },
 
   // Feedback
   { key: 'leave_review', roles: ['guest'] },
