@@ -576,7 +576,7 @@ The resulting link is also saved to `tables.qr_code_url` ("store QR metadata in 
 
 **Response:** `Content-Type: image/png`, 400×400 PNG body. **Response (404)** if no such table at that restaurant.
 
-**Not built:** the frontend side ("scan QR → pre-fill restaurant & table") — no frontend exists yet in this project beyond the Vite starter template, so there's nothing to wire this into yet.
+**Frontend side implemented (2026-09-18):** `frontend/src/pages/ScanPage.jsx`, the app's first real page — `/scan?code={qr_code_unique_id}` (exactly the link the QR above encodes). Requests the guest's location, calls `POST /v1/tables/:qrCodeId/scan`, then `GET /v1/guest/session` + `GET /v1/restaurants/:id` in parallel to "pre-fill" restaurant name, table number, and assigned server, and applies the restaurant's white-label colors/name (`frontend/src/theme.js`) — verified live by replaying the exact same 3-call sequence against a seeded restaurant/table/assigned-staff fixture, including both real error paths (too far away, invalid code). **Not built:** anything past that confirmation screen (menu browsing, cart, ordering) — this was scoped to exactly the scan→pre-fill flow, not the full guest ordering UI.
 
 ---
 
