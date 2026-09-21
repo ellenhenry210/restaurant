@@ -50,7 +50,7 @@ export async function create(req, res) {
   }
 
   const { phone_number, guest_name, items, special_requests, tip_amount: tipAmount } = req.body;
-  const { restaurant_id: restaurantId, table_id: tableId } = req.guestSession;
+  const { restaurant_id: restaurantId, table_id: tableId, sitting_id: sittingId } = req.guestSession;
 
   const client = await pool.connect();
   try {
@@ -199,6 +199,7 @@ export async function create(req, res) {
         restaurantId,
         tableId,
         guestProfileId,
+        sittingId,
         orderNumber,
         subtotal,
         tax,

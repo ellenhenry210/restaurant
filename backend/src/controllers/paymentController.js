@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 import { pool } from '../db.js';
 import * as paymentModel from '../models/paymentModel.js';
+import * as billModel from '../models/billModel.js';
 import { initializeTransaction, verifyWebhookSignature } from '../paystack.js';
 
 // ---------------------------------------------------------------------
@@ -120,10 +121,22 @@ export async function handleWebhook(req, res) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await paymentModel.markTransactionResolved(
-        { transactionId: transaction.id, orderId: transaction.order_id, status: resolvedStatus, gatewayResponse: event.data },
-        client
-      );
+      // A bill-level transaction (whole-bill or per-share — see
+      // billController.js) has bill_id set instead of order_id; branch
+      // to its own resolution path rather than trying to force both
+      // shapes through markTransactionResolved, which assumes exactly
+      // one order.
+      if (transaction.bill_id) {
+        await billModel.resolveBillTransaction(
+          { transactionId: transaction.id, billId: transaction.bill_id, reference, status: resolvedStatus, gatewayResponse: event.data },
+          client
+        );
+      } else {
+        await paymentModel.markTransactionResolved(
+          { transactionId: transaction.id, orderId: transaction.order_id, status: resolvedStatus, gatewayResponse: event.data },
+          client
+        );
+      }
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');

@@ -79,6 +79,15 @@ export async function addIngredientToMeal(mealId, restaurantId, overrides = {}) 
   return ingredient.rows[0].id;
 }
 
+/** An open table_sittings row — the "visit" grouping bills/orders attach to. */
+export async function createSitting(restaurantId, tableId) {
+  const result = await pool.query(
+    `INSERT INTO table_sittings (restaurant_id, table_id) VALUES ($1, $2) RETURNING id`,
+    [restaurantId, tableId]
+  );
+  return result.rows[0].id;
+}
+
 /** A proximity-verified guest session (as if POST /v1/tables/:qrCodeId/scan had already run) + its Bearer token. */
 export async function createGuestSession(restaurantId, tableId, overrides = {}) {
   let guestProfileId = overrides.guestProfileId ?? null;
@@ -90,28 +99,33 @@ export async function createGuestSession(restaurantId, tableId, overrides = {}) 
     guestProfileId = profile.rows[0].id;
   }
 
+  const sittingId = overrides.sittingId ?? (await createSitting(restaurantId, tableId));
+
   const session = await pool.query(
-    `INSERT INTO guest_sessions (restaurant_id, table_id, guest_profile_id, scan_latitude, scan_longitude, distance_meters, expires_at)
-     VALUES ($1, $2, $3, 6.5244, 3.3792, 10, NOW() + INTERVAL '4 hours') RETURNING id`,
-    [restaurantId, tableId, guestProfileId]
+    `INSERT INTO guest_sessions (restaurant_id, table_id, guest_profile_id, sitting_id, scan_latitude, scan_longitude, distance_meters, expires_at)
+     VALUES ($1, $2, $3, $4, 6.5244, 3.3792, 10, NOW() + INTERVAL '4 hours') RETURNING id`,
+    [restaurantId, tableId, guestProfileId, sittingId]
   );
 
   return {
     sessionId: session.rows[0].id,
     guestProfileId,
+    sittingId,
     token: generateGuestToken(session.rows[0].id, { tableId, restaurantId }),
   };
 }
 
 export async function createOrder(restaurantId, tableId, overrides = {}) {
   const result = await pool.query(
-    `INSERT INTO orders (restaurant_id, table_id, guest_profile_id, order_number, status, subtotal, tax, service_charge, total_amount, tip_amount, confirmed_at, ready_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-     RETURNING id, total_amount, tip_amount`,
+    `INSERT INTO orders (restaurant_id, table_id, guest_profile_id, sitting_id, bill_id, order_number, status, subtotal, tax, service_charge, total_amount, tip_amount, confirmed_at, ready_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+     RETURNING id, total_amount, tip_amount, sitting_id, bill_id`,
     [
       restaurantId,
       tableId,
       overrides.guestProfileId ?? null,
+      overrides.sittingId ?? null,
+      overrides.billId ?? null,
       overrides.orderNumber ?? `ORD-TEST-${unique()}`,
       overrides.status ?? 'placed',
       overrides.subtotal ?? 2000,

@@ -769,7 +769,7 @@ Implementation: `backend/src/routes/tables.js` (`POST /:tableId/assign`, `POST /
 
 ---
 
-## Payment & Billing Model (Design finalized 2026-09-21 — schema implemented via migration 013; routes/controllers/frontend still to build)
+## Payment & Billing Model (IMPLEMENTED 2026-09-21 — migrations 013-015 + routes/controllers; frontend still to build)
 
 Full spec given by the user 2026-09-21: three payment-timing choices (**Pay Now**, **Pay After**, **Pay Traditionally**), with a **split-the-bill vs. pay-whole** choice under the first two, and a **"Call the waiter/waitress"** action under the third (choosing Pay Traditionally *is* the call — there's no separate button elsewhere).
 

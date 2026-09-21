@@ -588,7 +588,7 @@ On a `charge.success`/`charge.failed` event matching a known `reference`, update
 
 ---
 
-## Bills & Payment Timing (Design finalized 2026-09-21 — schema implemented via migration 013; endpoints below not yet built)
+## Bills & Payment Timing (IMPLEMENTED 2026-09-21 — migrations 013-015, `backend/src/{models,controllers,routes}/{bill,staffCall}*.js`)
 
 Supersedes the payment endpoints above once built — see `SNAPORDER_DATABASE_SCHEMA.md`'s "Payment & Billing Model" section for the full schema and rationale (`table_sittings`, `bills`, `bill_splits`/`bill_split_shares`, `staff_calls`, `guest_visits`). Summary of the flow: a guest picks one of three timings (**Pay Now** / **Pay After** / **Pay Traditionally**); Pay Now/Pay After additionally can request a **split**, which defaults to **whole** (one consolidated bill) until explicitly requested; Pay Traditionally has no split choice and instead fires a waiter call.
 
@@ -636,6 +636,8 @@ Staff-side, `process_payment` permission (Waiter/Manager/Owner/System Admin). Bo
 Staff-side, `process_payment` permission. Lists open calls for the front-of-house view (a "tables asking for the bill" list) — the REST fallback/backfill for anyone who reconnects after missing the `waiter_called` socket event.
 
 **Not designed yet, flagged rather than guessed:** itemized/by-item splitting (a third `split_type`, deferred — needs order-line-item-level UI); an explicit "close sitting" endpoint for staff (needed for a table that never completes checkout in-app); when/how `guest_visits` (schema doc, table 27) actually gets written — presumably on sitting close, not decided here.
+
+**Real bug found and fixed while building this, 2026-09-21:** `bills.status` was declared `VARCHAR(20)` in migration 013, but its own CHECK constraint already listed `'settled_traditionally'` (22 characters) as valid — never caught until an integration test actually tried to write it via the staff-call resolve path. Fixed by migration 015 (widened to `VARCHAR(30)`). No frontend exists yet for any of this — guest pay-now/after/traditional + split UI, and the staff-side "tables asking for the bill" view, are the next real UI work.
 
 ---
 

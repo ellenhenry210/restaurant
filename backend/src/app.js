@@ -13,6 +13,8 @@ import restaurantOrderRoutes from './routes/restaurantOrders.js';
 import tableRoutes from './routes/tables.js';
 import paymentRoutes from './routes/payments.js';
 import qrRoutes from './routes/qr.js';
+import billRoutes from './routes/bills.js';
+import staffCallRoutes from './routes/staffCalls.js';
 
 // Split out of index.js (2026-09-17) so the Express app can be imported
 // on its own — by supertest in integration tests, or by anything else
@@ -94,6 +96,15 @@ app.use('/v1/restaurants/:restaurantId/tables', tableRoutes);
 // routes/qr.js for why this is its own top-level namespace instead of
 // nesting under the tables mount above.
 app.use('/v1/qr', qrRoutes);
+
+// Table-level billing (SNAPORDER_DATABASE_SCHEMA.md's "Payment & Billing
+// Model") — guest-facing, behind authenticateGuest. See routes/bills.js
+// for why this is mounted at /v1 rather than a resource prefix.
+app.use('/v1', billRoutes);
+
+// Staff-side of the Pay-Traditionally "call the waiter" flow — behind
+// authenticate + authorize('process_payment'). See routes/staffCalls.js.
+app.use('/v1/restaurants/:restaurantId/staff-calls', staffCallRoutes);
 
 // 404 for anything that didn't match a route above — must come after
 // every real route. Without this, an unmatched path (a typo, a

@@ -26,7 +26,7 @@ export async function insertTransaction(data, executor = pool) {
 
 export async function findTransactionByReference(reference, executor = pool) {
   const result = await executor.query(
-    `SELECT id, order_id, restaurant_id, reference, amount, status FROM payment_transactions WHERE reference = $1`,
+    `SELECT id, order_id, bill_id, restaurant_id, reference, amount, status FROM payment_transactions WHERE reference = $1`,
     [reference]
   );
   return result.rows[0] ?? null;

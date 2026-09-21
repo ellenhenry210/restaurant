@@ -5,6 +5,7 @@ import { pool } from '../db.js';
 import { generateGuestToken } from '../auth.js';
 import { authenticateGuest } from '../middleware/authGuest.js';
 import { distanceMeters } from '../geo.js';
+import * as billModel from '../models/billModel.js';
 
 const router = Router();
 
@@ -83,12 +84,22 @@ router.post('/tables/:qrCodeId/scan', async (req, res) => {
       });
     }
 
-    // Within range. Generate the session id ourselves (rather than
-    // letting Postgres's gen_random_uuid() default assign one) so we
-    // have it before the row exists, to embed in the token — then decode
-    // the token's own exp back out, so guest_sessions.expires_at and the
-    // JWT's expiry can never drift apart by re-deriving the same "4h"
-    // duration two different ways.
+    // Within range. Join the table's currently open sitting (another
+    // guest at the same table, same visit) or open a fresh one — this is
+    // the "a new group has sat down" signal (SNAPORDER_DATABASE_SCHEMA.md's
+    // "Payment & Billing Model" section): the natural, already-existing
+    // trigger point, no separate guest action needed.
+    let sitting = await billModel.findOpenSittingByTable(table.table_id);
+    if (!sitting) {
+      sitting = await billModel.createSitting(table.restaurant_id, table.table_id);
+    }
+
+    // Generate the session id ourselves (rather than letting Postgres's
+    // gen_random_uuid() default assign one) so we have it before the row
+    // exists, to embed in the token — then decode the token's own exp
+    // back out, so guest_sessions.expires_at and the JWT's expiry can
+    // never drift apart by re-deriving the same "4h" duration two
+    // different ways.
     const sessionId = crypto.randomUUID();
     const token = generateGuestToken(sessionId, {
       tableId: table.table_id,
@@ -98,9 +109,9 @@ router.post('/tables/:qrCodeId/scan', async (req, res) => {
     const expiresAt = new Date(exp * 1000);
 
     await pool.query(
-      `INSERT INTO guest_sessions (id, table_id, restaurant_id, scan_latitude, scan_longitude, distance_meters, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [sessionId, table.table_id, table.restaurant_id, latitude, longitude, distance, expiresAt]
+      `INSERT INTO guest_sessions (id, table_id, restaurant_id, sitting_id, scan_latitude, scan_longitude, distance_meters, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [sessionId, table.table_id, table.restaurant_id, sitting.id, latitude, longitude, distance, expiresAt]
     );
 
     res.status(201).json({

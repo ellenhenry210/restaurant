@@ -85,18 +85,19 @@ export async function nextOrderNumberSeq(executor = pool) {
 
 /**
  * Insert the order row.
- * @param {object} data { restaurantId, tableId, guestProfileId, orderNumber, subtotal, tax, serviceCharge, totalAmount, tip, specialRequests }
+ * @param {object} data { restaurantId, tableId, guestProfileId, sittingId, orderNumber, subtotal, tax, serviceCharge, totalAmount, tip, specialRequests }
  * @returns {Promise<object>} the inserted row (id, order_number, status, subtotal, tax, service_charge, total_amount, tip_amount, currency, placed_at)
  */
 export async function insertOrder(data, executor = pool) {
   const result = await executor.query(
-    `INSERT INTO orders (restaurant_id, table_id, guest_profile_id, order_number, subtotal, tax, service_charge, total_amount, tip_amount, special_requests)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `INSERT INTO orders (restaurant_id, table_id, guest_profile_id, sitting_id, order_number, subtotal, tax, service_charge, total_amount, tip_amount, special_requests)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING id, order_number, status, subtotal, tax, service_charge, total_amount, tip_amount, currency, placed_at`,
     [
       data.restaurantId,
       data.tableId,
       data.guestProfileId,
+      data.sittingId,
       data.orderNumber,
       data.subtotal,
       data.tax,

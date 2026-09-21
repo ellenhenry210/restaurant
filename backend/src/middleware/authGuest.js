@@ -56,7 +56,7 @@ export async function authenticateGuest(req, res, next) {
 
   try {
     const result = await pool.query(
-      `SELECT id, table_id, restaurant_id, guest_profile_id, expires_at
+      `SELECT id, table_id, restaurant_id, guest_profile_id, sitting_id, expires_at
        FROM guest_sessions
        WHERE id = $1`,
       [payload.sub]

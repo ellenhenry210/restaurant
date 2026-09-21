@@ -102,6 +102,41 @@ async function handleConnection(socket) {
     return socket.disconnect(true);
   }
 
+  // Front-of-house staff generally (not kitchen-specific) — joined the
+  // same way as join_kitchen, but gated on process_payment rather than
+  // view_all_orders, since this room is specifically where a
+  // Pay-Traditionally "call the waiter" event lands.
+  socket.on('join_staff', async (data, ack) => {
+    const restaurantId = data?.restaurantId;
+    if (!restaurantId) {
+      return ack?.({ ok: false, error: 'restaurantId is required' });
+    }
+
+    try {
+      const staffResult = await pool.query(
+        'SELECT role, is_active FROM restaurant_staff WHERE user_id = $1 AND restaurant_id = $2',
+        [socket.data.identity.userId, restaurantId]
+      );
+      const staff = staffResult.rows[0];
+
+      if (!staff) {
+        return ack?.({ ok: false, error: 'You have no role at this restaurant' });
+      }
+      if (!staff.is_active) {
+        return ack?.({ ok: false, error: 'Your access to this restaurant has been deactivated' });
+      }
+      if (!roleGrants(staff.role, 'process_payment')) {
+        return ack?.({ ok: false, error: `Role '${staff.role}' cannot 'process_payment'` });
+      }
+
+      socket.join(`staff:${restaurantId}`);
+      ack?.({ ok: true, restaurant_id: restaurantId });
+    } catch (err) {
+      console.error('realtime: join_staff failed:', err.message);
+      ack?.({ ok: false, error: 'Failed to join' });
+    }
+  });
+
   socket.on('join_kitchen', async (data, ack) => {
     const restaurantId = data?.restaurantId;
     if (!restaurantId) {
@@ -149,4 +184,9 @@ export function emitOrderStatusUpdate(restaurantId, tableId, data) {
 /** One item's status changed — same audience as above. */
 export function emitItemStatusUpdate(restaurantId, tableId, data) {
   getIo().to(`kitchen:${restaurantId}`).to(`table:${tableId}`).emit('item_status_updated', data);
+}
+
+/** A guest chose Pay Traditionally — front-of-house staff need to go collect payment in person. */
+export function emitWaiterCalled(restaurantId, data) {
+  getIo().to(`staff:${restaurantId}`).emit('waiter_called', data);
 }
