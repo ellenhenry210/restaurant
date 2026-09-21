@@ -769,6 +769,202 @@ Implementation: `backend/src/routes/tables.js` (`POST /:tableId/assign`, `POST /
 
 ---
 
+## Payment & Billing Model (Design finalized 2026-09-21 — schema implemented via migration 013; routes/controllers/frontend still to build)
+
+Full spec given by the user 2026-09-21: three payment-timing choices (**Pay Now**, **Pay After**, **Pay Traditionally**), with a **split-the-bill vs. pay-whole** choice under the first two, and a **"Call the waiter/waitress"** action under the third (choosing Pay Traditionally *is* the call — there's no separate button elsewhere).
+
+**Revision note (same day):** the first draft of this design modeled a split as several separate `bills` rows (one per guest, `type: 'per_guest_split'`). A second, independently-drafted proposal (also reviewed 2026-09-21) argued for a cleaner shape — one bill per sitting always, with a split represented as shares *of* that one bill — and that proposal is correct: most real split requests ("split 4 ways evenly," "I'll pay for mine, custom amounts") aren't about who originally ordered what, which the by-guest model implicitly assumed. **This section now reflects the revised, final design** (`bill_splits`/`bill_split_shares`, below) — the by-guest-bills version is gone, not just superseded in place. That second proposal also contained real errors specific to *this* codebase (it assumed a `qr_sessions` table and an `INTEGER restaurants.id` — this project has `guest_sessions` and UUID PKs throughout; it also proposed a new `guests` table duplicating the already-existing `guest_profiles`, and kobo-integer amounts inconsistent with this schema's DECIMAL(10,2) Naira everywhere else) — its structural ideas were adopted, its schema particulars were not copied as-is.
+
+**Why the current implementation can't support this:** `orders` (table 11) is per guest session/scan, and `payment_transactions` (below) is per `order_id` — there is no concept of "everyone currently sitting at this table" above the level of one order, so there's nothing to attach a consolidated ("whole") bill to, and no way to know which orders belong together for a split. Two guests who each scan the same table's QR separately currently produce two completely unrelated orders with no shared identifier at all.
+
+**The missing piece: a table "sitting."** A restaurant POS calls this a "check" being opened when a table is sat — this schema needs the same concept, explicit rather than inferred from timestamps. A sitting is the boundary that says "these orders belong to the same visit, by the same group of guests, at this table" — it's what a bill actually bills.
+
+- A new guest scan (`POST /v1/tables/:qrCodeId/scan`) joins the table's currently **open** sitting if one exists, or opens a new one if the table has none open (i.e. this is the table's first guest since it last turned over). This is the natural, existing signal for "a new group has sat down" — no new guest action needed to trigger it.
+- A sitting closes when its bill(s) are fully settled (all `paid` or `settled_traditionally`), or a staff member closes it manually (e.g. guests leave without completing checkout in-app). A closed table can start a fresh sitting on the next scan.
+- `guest_sessions` (table 20) and `orders` (table 11) both gain a `sitting_id` FK once this is built — this is how "all orders in this sitting" becomes a plain query instead of a time-window heuristic.
+
+### 23. `payment_transactions` (implemented 2026-09-17, documented here retroactively — was missing from this file)
+Records every Paystack initialize attempt, not just successful ones. Currently keyed to `order_id` — **this is exactly the column the design below changes to `bill_id`**, since payment moves from being an order-level concept to a bill-level one.
+
+```sql
+CREATE TABLE payment_transactions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,  -- becomes bill_id, see below
+  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+
+  reference VARCHAR(100) NOT NULL,
+  amount DECIMAL(10, 2) NOT NULL,
+  currency VARCHAR(3) DEFAULT 'NGN',
+
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+  gateway VARCHAR(20) NOT NULL DEFAULT 'paystack',
+  authorization_url TEXT,
+  gateway_response JSONB,
+  paid_at TIMESTAMP,
+
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT chk_payment_transactions_status CHECK (status IN ('pending', 'success', 'failed', 'abandoned')),
+  CONSTRAINT unique_payment_reference UNIQUE (reference)
+);
+```
+
+### 24. `table_sittings` (new — IMPLEMENTED 2026-09-21, migration 013)
+One row per "visit" to a table, from first scan since turnover to full settlement. Exists specifically so a bill has something well-defined to bill — see rationale above.
+
+```sql
+CREATE TABLE table_sittings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+
+  status VARCHAR(20) NOT NULL DEFAULT 'open',
+  opened_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  closed_at TIMESTAMP,
+
+  CONSTRAINT chk_sitting_status CHECK (status IN ('open', 'closed')),
+  CONSTRAINT chk_sitting_times CHECK (closed_at IS NULL OR closed_at > opened_at)
+);
+
+CREATE INDEX idx_sittings_table ON table_sittings(table_id);
+CREATE INDEX idx_sittings_restaurant ON table_sittings(restaurant_id);
+
+-- One open sitting per table at a time — mirrors table_assignments'
+-- unique_active_assignment_per_table (table 22), same partial-unique-index pattern.
+CREATE UNIQUE INDEX unique_open_sitting_per_table ON table_sittings(table_id) WHERE status = 'open';
+```
+
+**Required changes to existing tables — added by migration 013, deliberately NULLABLE for now:** `guest_sessions.sitting_id`, `orders.sitting_id`, `orders.bill_id`, `payment_transactions.bill_id` (added *alongside* `payment_transactions.order_id`, which stays — not renamed). Nullable specifically because no route yet populates them (scan, order-creation, and payment-initialize all still need updating to do so) — making them `NOT NULL` now would have broken every currently-passing test and the real running guest flow. They become effectively-required once that route work lands; that's a follow-up code change, not a further schema change. `orders.payment_status`/`payment_method`/`payment_reference` (table 11) become redundant once a bill exists — **superseded by `bills.status`/`bills.timing` below, not duplicated on the order** — but aren't dropped yet either, for the same non-breaking reason.
+
+### 25. `bills` (new — IMPLEMENTED 2026-09-21, migration 013)
+The actual payable unit — **exactly one bill per sitting, always** (`UNIQUE (sitting_id)`). A split does not create additional bill rows; see `bill_splits`/`bill_split_shares` below for how a split is represented instead.
+
+```sql
+CREATE TABLE bills (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  sitting_id UUID NOT NULL REFERENCES table_sittings(id) ON DELETE CASCADE,
+  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,  -- denormalized, same pattern as payment_transactions
+
+  timing VARCHAR(20) NOT NULL,    -- 'pay_now' | 'pay_after' | 'pay_traditional'
+  status VARCHAR(20) NOT NULL DEFAULT 'open',
+
+  subtotal DECIMAL(10, 2) NOT NULL DEFAULT 0,
+  tax DECIMAL(10, 2) NOT NULL DEFAULT 0,
+  service_charge DECIMAL(10, 2) NOT NULL DEFAULT 0,
+  tip_amount DECIMAL(10, 2) NOT NULL DEFAULT 0,
+  total_amount DECIMAL(10, 2) NOT NULL DEFAULT 0,  -- computed from the sitting's orders at creation time
+
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  settled_at TIMESTAMP,
+
+  CONSTRAINT chk_bill_timing CHECK (timing IN ('pay_now', 'pay_after', 'pay_traditional')),
+  CONSTRAINT chk_bill_status CHECK (status IN ('open', 'split_requested', 'awaiting_payment', 'paid', 'settled_traditionally', 'cancelled')),
+  CONSTRAINT unique_bill_per_sitting UNIQUE (sitting_id)
+);
+
+CREATE INDEX idx_bills_restaurant ON bills(restaurant_id);
+```
+
+### `bill_splits` / `bill_split_shares` (new — IMPLEMENTED 2026-09-21, migration 013)
+Created **only** when a guest explicitly requests a split — nothing creates these automatically. Splits the one `bills` row into shares; does not create separate bill rows per guest/party.
+
+```sql
+CREATE TABLE bill_splits (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  bill_id UUID NOT NULL UNIQUE REFERENCES bills(id) ON DELETE CASCADE,  -- at most one active split per bill
+
+  split_type VARCHAR(10) NOT NULL,  -- 'even' | 'custom' — 'by_item' deferred, needs line-item-level UI
+  num_parties INT NOT NULL,
+
+  requested_by_session_id UUID REFERENCES guest_sessions(id) ON DELETE SET NULL,  -- a real FK, not a loose device string
+  requested_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT chk_split_type CHECK (split_type IN ('even', 'custom')),
+  CONSTRAINT chk_split_parties CHECK (num_parties >= 2)
+);
+
+CREATE TABLE bill_split_shares (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  split_id UUID NOT NULL REFERENCES bill_splits(id) ON DELETE CASCADE,
+
+  guest_label VARCHAR(50) NOT NULL,  -- e.g. "Guest 1", or a phone number if one was provided
+  amount_owed DECIMAL(10, 2) NOT NULL,
+  payment_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+  paystack_reference VARCHAR(100),
+  paid_at TIMESTAMP,
+
+  CONSTRAINT chk_share_payment_status CHECK (payment_status IN ('pending', 'paid', 'failed'))
+);
+
+CREATE INDEX idx_shares_split ON bill_split_shares(split_id);
+CREATE UNIQUE INDEX unique_share_paystack_reference ON bill_split_shares(paystack_reference) WHERE paystack_reference IS NOT NULL;
+```
+
+**Split semantics, v1:** `even` divides `bills.total_amount` across `num_parties` shares (remainder to the first share); `custom` takes caller-supplied per-share amounts that must sum to `total_amount` (validated by the controller, not the schema). Itemized/by-item splitting (assigning specific order line items to specific guests) is real and common but needs its own, richer UI — deliberately deferred, not assumed here.
+
+**Bill lifecycle:**
+- `pay_now` — guest requests a bill immediately; status goes `open` → `awaiting_payment` (a `payment_transactions` row created, keyed to `bill_id`) → `paid` on the webhook, same mechanism as today just moved one level up.
+- `pay_after` — a bill can be viewed (running total) before it's finalized; requesting payment moves it through the same `awaiting_payment` → `paid` states, just later in the visit.
+- `pay_traditional` — no `payment_transactions` row at all. Status goes `open` → `awaiting_payment` the moment the guest chooses this (which is also what fires the waiter call, below) → `settled_traditionally`, set by a staff member (`process_payment` permission) once they've collected payment in person — a manual, staff-confirmed transition, matching the existing pattern of staff-only state transitions elsewhere (order status, kitchen item status).
+- **Split enforcement (controller-level rule, not just documentation):** requesting a split (`POST .../request-split`) moves `bills.status` to `split_requested`. From that point, the whole-bill single-payment endpoint (`POST /v1/bills/:billId/payments/initialize`) must reject with `409` — all payment has to go through the per-share endpoint instead. Until a split is requested, the whole-bill endpoint is always the available default, matching "one bill per table by default, split only on explicit request."
+
+### 26. `staff_calls` (new — IMPLEMENTED 2026-09-21, migration 013)
+Durable record of a guest asking for staff — not just a fire-and-forget socket event, for the same audit-trail reason `guest_sessions` isn't a bare JWT. Scoped to payment for this design pass (`reason` is deliberately an enum, not a free-text button, so it stays a small, extensible set rather than open-ended "chat with staff").
+
+```sql
+CREATE TABLE staff_calls (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+  sitting_id UUID NOT NULL REFERENCES table_sittings(id) ON DELETE CASCADE,
+  bill_id UUID REFERENCES bills(id) ON DELETE SET NULL,  -- set when the call is "come collect payment for this bill"
+
+  reason VARCHAR(20) NOT NULL DEFAULT 'payment',
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  acknowledged_at TIMESTAMP,
+  acknowledged_by UUID REFERENCES restaurant_staff(id) ON DELETE SET NULL,
+  resolved_at TIMESTAMP,
+
+  CONSTRAINT chk_staff_call_reason CHECK (reason IN ('payment')),
+  CONSTRAINT chk_staff_call_status CHECK (status IN ('pending', 'acknowledged', 'resolved'))
+);
+
+CREATE INDEX idx_staff_calls_restaurant ON staff_calls(restaurant_id, status);
+CREATE INDEX idx_staff_calls_table ON staff_calls(table_id);
+```
+
+**Realtime:** a new Socket.io event, `waiter_called`, broadcast to a new `staff:{restaurantId}` room (staff join it the same way they join `kitchen:{restaurantId}` today — see `backend/src/realtime.js` — but this room is for front-of-house staff generally, not kitchen specifically). Payload includes `table_id`/`table_number` and the `bill_id` so staff know exactly which check to bring. `PATCH /v1/restaurants/:restaurantId/staff-calls/:callId` (`process_payment` permission) moves it `pending` → `acknowledged` → `resolved`, and is also the trigger for moving the linked bill to `settled_traditionally` once payment is actually collected.
+
+### 27. `guest_visits` (new — IMPLEMENTED 2026-09-21, migration 013) — the Phase 1 guest-history slot-in
+Explicit user decision 2026-09-21: guest history was originally scoped to Phase 2, but VIP tiers, points, and churn detection (Phase 2 features, per the Guest History & Analytics spec) all depend on visits being attributable to a guest from day one — data Phase 1 would otherwise generate and lose. This is deliberately the *minimal* capture layer, not the full Phase 2 analytics (no churn scoring, no VIP tier progression, no cross-restaurant timeline) — those stay Phase 2, built on top of this.
+
+**Reuses the existing `guest_profiles` (table 10)** as the identity anchor — phone-number-keyed, created on a guest's first order, already in this schema since 2026-09-17 — rather than adding a new `guests` table, which a second draft of this design proposed without knowing `guest_profiles` already existed. That also means the already-existing, already-nullable `orders.guest_profile_id` *is* the "attribute every order to a guest" column a second draft proposed adding as `orders.guest_id` — it's already there, nothing new needed on `orders` for this part.
+
+```sql
+CREATE TABLE guest_visits (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  guest_profile_id UUID REFERENCES guest_profiles(id) ON DELETE SET NULL,  -- NULL if the guest never placed an order this visit
+  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  sitting_id UUID NOT NULL UNIQUE REFERENCES table_sittings(id) ON DELETE CASCADE,
+  bill_id UUID REFERENCES bills(id) ON DELETE SET NULL,
+
+  total_spent DECIMAL(10, 2),  -- filled from bills.total_amount once the sitting's bill settles
+  visited_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_guest_visits_profile ON guest_visits(guest_profile_id);
+CREATE INDEX idx_guest_visits_restaurant ON guest_visits(restaurant_id);
+```
+
+**Important scope caveat, not previously written down:** this inherits `guest_profiles`' existing scope — **per restaurant**, not cross-restaurant. A guest's phone number gets a *different* `guest_profiles` row at each restaurant they visit, so `guest_visits` naturally gives "has this guest been to *this* restaurant before," not "has this guest been to any SnapOrder restaurant before." True cross-restaurant guest identity (in SnapOrder's longer-term spec) needs a platform-level identity layer above `guest_profiles` — a separate, later architectural decision, not something this migration assumes or forecloses. Repeat-visit detection per restaurant, though, is now trivial once this table is populated: `COUNT(*) FROM guest_visits WHERE guest_profile_id = X`.
+
+**Not designed yet, flagged rather than guessed:** itemized/by-item splitting (noted above); what happens to an `open` `pay_after` bill if a guest's session expires/is revoked before they pay (leaves without paying — likely needs a staff-visible "unpaid, guest gone" state, but that's a policy decision, not a schema one); whether `pay_traditional` should still let the guest see a running itemized total in-app before staff arrives; when/how `guest_visits` actually gets written (on sitting close, presumably — route logic, not decided in this schema pass); the cross-restaurant identity layer noted above.
+
+---
+
 ## Relationships Summary
 
 ```

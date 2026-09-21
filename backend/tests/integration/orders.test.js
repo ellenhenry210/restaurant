@@ -113,4 +113,15 @@ describe('GET /v1/orders/:id', () => {
     const res = await request(app).get(`/v1/orders/${created.body.id}`).set('Authorization', `Bearer ${otherGuest.token}`);
     expect(res.status).toBe(403);
   });
+
+  it('includes payment_status — the guest-facing order-status page needs it to decide whether to show a Pay button', async () => {
+    const { mealId, guest } = await setUp();
+    const created = await request(app)
+      .post('/v1/orders')
+      .set('Authorization', `Bearer ${guest.token}`)
+      .send({ phone_number: '+2348012345678', items: [{ meal_id: mealId, quantity: 1 }] });
+
+    const res = await request(app).get(`/v1/orders/${created.body.id}`).set('Authorization', `Bearer ${guest.token}`);
+    expect(res.body.payment_status).toBe('pending');
+  });
 });

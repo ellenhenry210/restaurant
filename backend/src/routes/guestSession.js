@@ -116,6 +116,87 @@ router.post('/tables/:qrCodeId/scan', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
+// POST /guest/session/heartbeat — periodic re-proof of location for an
+// already-issued session. The scan endpoint above only ever checked
+// distance once, at issuance; without this, a guest who scanned while
+// present and then left kept full access for the rest of the token's
+// 4-hour life. The frontend calls this on an interval for as long as a
+// session is active (see RequireGuestSession.jsx) and drops the session
+// the moment this returns 403.
+//
+// Deliberately does NOT extend expires_at — this only re-verifies an
+// existing session's location, it isn't a renewal mechanism.
+// ---------------------------------------------------------------------
+router.post('/guest/session/heartbeat', authenticateGuest, async (req, res) => {
+  const errors = validateScanInput(req.body ?? {});
+  if (errors.length > 0) {
+    return res.status(400).json({
+      error: { code: 'INVALID_REQUEST', message: 'One or more fields are invalid', details: errors },
+    });
+  }
+
+  const { latitude, longitude } = req.body;
+
+  try {
+    const restaurantResult = await pool.query(
+      `SELECT name, latitude AS restaurant_lat, longitude AS restaurant_lon, max_guest_distance_meters
+       FROM restaurants WHERE id = $1`,
+      [req.guestSession.restaurant_id]
+    );
+    const restaurant = restaurantResult.rows[0];
+
+    // The original scan already required a configured location to reach
+    // this point at all, but a restaurant could theoretically clear its
+    // coordinates afterwards — fail closed the same way scan does rather
+    // than assume this can't happen.
+    if (!restaurant || restaurant.restaurant_lat === null || restaurant.restaurant_lon === null) {
+      return res.status(403).json({
+        error: { code: 'FORBIDDEN', message: 'This restaurant has not configured its location — your session cannot be re-verified' },
+      });
+    }
+
+    const distance = distanceMeters(
+      { latitude, longitude },
+      { latitude: Number(restaurant.restaurant_lat), longitude: Number(restaurant.restaurant_lon) }
+    );
+
+    await pool.query(
+      `UPDATE guest_sessions SET last_checked_at = NOW(), last_latitude = $2, last_longitude = $3, last_distance_meters = $4 WHERE id = $1`,
+      [req.guestSession.id, latitude, longitude, distance]
+    );
+
+    if (distance > restaurant.max_guest_distance_meters) {
+      // Revoke immediately, the same way an operator-initiated revocation
+      // works (authGuest.js's expires_at check) — set it into the past
+      // rather than deleting the row, so it stays in place as an audit
+      // trail of exactly when/why this session ended.
+      await pool.query(`UPDATE guest_sessions SET expires_at = NOW() WHERE id = $1`, [req.guestSession.id]);
+      await pool.query(
+        `INSERT INTO audit_log (restaurant_id, action, actor_type, actor_id, resource_type, resource_id, changes)
+         VALUES ($1, 'guest_session_revoked', 'guest', $2, 'guest_session', $2, $3)`,
+        [
+          req.guestSession.restaurant_id,
+          req.guestSession.id,
+          JSON.stringify({ reason: 'out_of_range', distance_meters: Math.round(distance * 10) / 10, max_allowed: restaurant.max_guest_distance_meters }),
+        ]
+      );
+
+      return res.status(403).json({
+        error: {
+          code: 'FORBIDDEN',
+          message: `You've moved out of range of ${restaurant.name} — please scan the table's QR code again to continue.`,
+        },
+      });
+    }
+
+    res.json({ ok: true, distance_meters: Math.round(distance * 10) / 10 });
+  } catch (err) {
+    console.error('POST /guest/session/heartbeat: failed:', err.message);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to verify session' } });
+  }
+});
+
+// ---------------------------------------------------------------------
 // GET /guest/session — "who is this guest session" (the authenticateGuest
 // counterpart to GET /v1/me), and the working proof that it functions:
 // no session, expired session, or a staff token all get rejected; a

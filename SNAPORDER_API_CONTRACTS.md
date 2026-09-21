@@ -216,8 +216,30 @@ Get all menus for a restaurant.
 
 ---
 
+### GET `/v1/restaurants/{restaurantId}/menus/{menuId}/meals`
+Implemented (2026-09-18) — `backend/src/controllers/menuController.js`. **Supersedes** the "not yet built" note this used to carry: a menu's categories, each with its available (`is_available = true`) meals nested — built specifically to unblock the frontend menu-browsing page (`frontend/src/pages/MenuPage.jsx`), which needs one call to render a whole menu rather than fetching meals one at a time. A category with zero available meals still appears, with `meals: []`, rather than silently disappearing.
+
+**Response (200):**
+```json
+{
+  "id": "uuid", "name": "Main Menu", "description": null,
+  "categories": [
+    {
+      "id": "uuid", "name": "Mains",
+      "meals": [
+        { "id": "uuid", "name": "Jollof Rice", "description": null, "image_url": null, "base_price": "3500.00", "currency": "NGN", "calories": null, "protein_grams": null, "is_vegan": false, "is_vegetarian": false, "is_gluten_free": false, "is_low_calorie": false, "is_high_protein": false, "estimated_prep_time_minutes": null }
+      ]
+    },
+    { "id": "uuid", "name": "Drinks", "meals": [] }
+  ]
+}
+```
+**Response (404)** if the menu doesn't exist or doesn't belong to `restaurantId`.
+
+---
+
 ### GET `/v1/meals/{id}`
-Meal details, with ingredients and addons joined in. **Not yet built:** listing all meals in a specific menu (`GET /restaurants/{restaurantId}/menus/{menuId}/meals` from an earlier draft of this doc) — meals are currently only fetched one at a time by id.
+Meal details, with ingredients and addons joined in.
 
 **Response (200):**
 ```json
@@ -350,12 +372,15 @@ Get order status. Ownership is table-based: the order's `table_id` must match th
   "total_amount": "6600.00",
   "tip_amount": "300.00",
   "grand_total": 6900,
+  "payment_status": "pending",
+  "payment_reference": null,
   "server": { "name": "Wendy", "role": "waiter" },
   "items": [
     { "id": "item_uuid", "meal_name": "Grilled Chicken Rice", "quantity": 2, "status": "pending", "special_request": "Extra spicy" }
   ]
 }
 ```
+`payment_status`/`payment_reference` added 2026-09-18 — previously missing here even though the Payments section's endpoints have written them since migration 010; the frontend order-status page (`frontend/src/pages/OrderStatusPage.jsx`) needs this to decide whether to show a "Pay with Paystack" button.
 
 **Response (403)** `"This order does not belong to your table"` if the order exists but belongs to a different table. **Response (404)** if it doesn't exist at all — verified live that these two cases are distinguishable to a legitimate caller.
 
@@ -560,6 +585,57 @@ Paystack requires an `email` field; guests only ever provide a phone number (`gu
 Paystack calls this directly — no guest/staff session at all. The HMAC-SHA512 signature (`x-paystack-signature` header, verified against `PAYSTACK_WEBHOOK_SECRET`) **is** the authentication; there is no other check. Mounted in `index.js` with `express.raw()` **before** the app-wide `express.json()`, since the signature must be verified against the exact raw request bytes — re-parsing to JSON first would produce a different hash and reject every real webhook.
 
 On a `charge.success`/`charge.failed` event matching a known `reference`, updates that `payment_transactions` row and, on success, sets `orders.payment_status = 'completed'` — one DB transaction, so a crash mid-update can't leave the two out of sync. Always acknowledges `200` once the signature is valid (Paystack retries on non-2xx; an event this endpoint doesn't act on is still acknowledged, not retried forever). An **invalid signature is rejected with `401`** and logged — the one case that isn't acknowledged.
+
+---
+
+## Bills & Payment Timing (Design finalized 2026-09-21 — schema implemented via migration 013; endpoints below not yet built)
+
+Supersedes the payment endpoints above once built — see `SNAPORDER_DATABASE_SCHEMA.md`'s "Payment & Billing Model" section for the full schema and rationale (`table_sittings`, `bills`, `bill_splits`/`bill_split_shares`, `staff_calls`, `guest_visits`). Summary of the flow: a guest picks one of three timings (**Pay Now** / **Pay After** / **Pay Traditionally**); Pay Now/Pay After additionally can request a **split**, which defaults to **whole** (one consolidated bill) until explicitly requested; Pay Traditionally has no split choice and instead fires a waiter call.
+
+**Revised 2026-09-21 from an earlier draft:** a bill is always exactly **one row per sitting** — a split does not create multiple bill rows (an earlier draft had this wrong). A split instead creates one `bill_splits` row plus N `bill_split_shares` rows *against that same bill*. This changes the endpoint shapes below from the original draft.
+
+### POST `/v1/guest/session/bill`
+Behind `authenticateGuest`. Gets-or-creates **the one bill** for the caller's table's current open sitting (idempotent — a second call for the same sitting returns the existing bill, it doesn't create another).
+
+**Request:** `{ "timing": "pay_now" | "pay_after" | "pay_traditional" }`.
+
+**Behavior:**
+- Creates one `bills` row (`status: 'open'`) covering every order currently in the sitting.
+- `timing: 'pay_traditional'` — also creates a `staff_calls` row (`reason: 'payment'`) and emits `waiter_called` to the `staff:{restaurantId}` socket room, and sets `bills.status = 'awaiting_payment'` immediately (no separate payment step to trigger — staff handle it in person).
+
+**Response (201):** `{ id, timing, status, subtotal, tax, service_charge, tip_amount, total_amount }`.
+
+### GET `/v1/guest/session/bill/:billId`
+View the bill's current total/state — used for `pay_after` to check the running total before deciding to pay, and to poll status after initializing payment. Ownership check: the bill's `sitting_id` must match the caller's own guest session's sitting.
+
+### POST `/v1/bills/:billId/request-split`
+Behind `authenticateGuest`, same ownership check as above. **The only path that creates a split — nothing does it automatically.**
+
+**Request:** `{ "split_type": "even" | "custom", "num_parties": number, "shares"?: [{ "guest_label": string, "amount_owed": number }] }` — `shares` required (and validated to sum to exactly `bills.total_amount`) when `split_type` is `custom`; ignored (auto-computed, even division with the remainder on the first share) when `even`.
+
+Creates `bill_splits` + `bill_split_shares`, sets `bills.status = 'split_requested'`. Rejected (`409`) if the bill is already `split_requested` or later — a split can be requested once per bill.
+
+**Once this succeeds, `POST /v1/bills/:billId/payments/initialize` (below) starts rejecting with `409`** — all payment for this bill must go through the per-share endpoint from this point on. This is the enforced version of "split only on explicit request, not by default."
+
+### GET `/v1/bills/:billId/splits`
+Returns the share breakdown (`guest_label`, `amount_owed`, `payment_status` per share) for display on each guest's own device.
+
+### POST `/v1/bills/:billId/payments/initialize`
+The default, whole-bill payment path — replaces `POST /v1/orders/{orderId}/payments/initialize` above with an identical Paystack flow (synthesized guest email, kobo conversion, `callback_url`), just keyed to a bill instead of a single order. **Rejected `409` if `bills.status` is `split_requested` or later** (see above) — once split, payment must go per-share. Rejected `400` if `bills.timing` is `pay_traditional` — that path never touches Paystack at all.
+
+### POST `/v1/bills/splits/:shareId/payments/initialize`
+Same Paystack flow, scoped to one `bill_split_shares.amount_owed` instead of the whole bill. When every share for a split reaches `paid`, the parent `bills.status` also flips to `paid`.
+
+### POST `/v1/payments/webhook`
+Unchanged mechanism (signature verification, `express.raw()` mounting). On success: if the reference matches a whole-bill payment, sets that `payment_transactions` row (now also carrying `bill_id`) and `bills.status = 'paid'`/`settled_at = NOW()`; if it matches a share, sets that share's `payment_status = 'paid'`/`paid_at`, and additionally checks whether all sibling shares are now `paid` to cascade the parent bill to `paid` too.
+
+### PATCH `/v1/restaurants/{restaurantId}/staff-calls/{callId}`
+Staff-side, `process_payment` permission (Waiter/Manager/Owner/System Admin). Body: `{ "status": "acknowledged" | "resolved" }`. Moving to `resolved` for a call tied to a `pay_traditional` bill also sets that bill's `status` to `settled_traditionally` — the staff-confirmed "I actually collected the payment" step, not something a guest action can complete on its own.
+
+### GET `/v1/restaurants/{restaurantId}/staff-calls?status=pending`
+Staff-side, `process_payment` permission. Lists open calls for the front-of-house view (a "tables asking for the bill" list) — the REST fallback/backfill for anyone who reconnects after missing the `waiter_called` socket event.
+
+**Not designed yet, flagged rather than guessed:** itemized/by-item splitting (a third `split_type`, deferred — needs order-line-item-level UI); an explicit "close sitting" endpoint for staff (needed for a table that never completes checkout in-app); when/how `guest_visits` (schema doc, table 27) actually gets written — presumably on sitting close, not decided here.
 
 ---
 

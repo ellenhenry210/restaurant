@@ -33,6 +33,70 @@ export async function findMenusByRestaurant(restaurantId, { activeOnly }) {
   return result.rows;
 }
 
+/** @returns {Promise<{id, name, description, is_active}|null>} — only if it belongs to this restaurant. */
+export async function findMenuById(menuId, restaurantId, executor = pool) {
+  const result = await executor.query(
+    `SELECT id, name, description, is_active FROM menus WHERE id = $1 AND restaurant_id = $2`,
+    [menuId, restaurantId]
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * A menu's categories, each with its available meals nested — the
+ * "listing meals within a specific menu" endpoint flagged as not yet
+ * built (SNAPORDER_API_CONTRACTS.md). One query, grouped in JS rather
+ * than SQL (no json_agg elsewhere in this codebase; a flat result set +
+ * a single pass is simpler and consistent with it) — same N+1 avoidance
+ * as findMenusByRestaurant above. LEFT JOIN + a category-only row when a
+ * category has zero available meals, so an empty category still shows
+ * up rather than silently vanishing.
+ * @param {string} menuId
+ * @returns {Promise<{id, name, meals: object[]}[]>}
+ */
+export async function findCategoriesWithMealsByMenu(menuId, executor = pool) {
+  const result = await executor.query(
+    `SELECT
+       mc.id AS category_id, mc.name AS category_name, mc.sort_order AS category_sort_order,
+       meals.id AS meal_id, meals.name AS meal_name, meals.description AS meal_description,
+       meals.image_url, meals.base_price, meals.currency,
+       meals.calories, meals.protein_grams,
+       meals.is_vegan, meals.is_vegetarian, meals.is_gluten_free, meals.is_low_calorie, meals.is_high_protein,
+       meals.estimated_prep_time_minutes, meals.sort_order AS meal_sort_order
+     FROM meal_categories mc
+     LEFT JOIN meals ON meals.category_id = mc.id AND meals.is_available = TRUE
+     WHERE mc.menu_id = $1 AND mc.is_active = TRUE
+     ORDER BY mc.sort_order ASC, meals.sort_order ASC`,
+    [menuId]
+  );
+
+  const categoriesById = new Map();
+  for (const row of result.rows) {
+    if (!categoriesById.has(row.category_id)) {
+      categoriesById.set(row.category_id, { id: row.category_id, name: row.category_name, meals: [] });
+    }
+    if (row.meal_id) {
+      categoriesById.get(row.category_id).meals.push({
+        id: row.meal_id,
+        name: row.meal_name,
+        description: row.meal_description,
+        image_url: row.image_url,
+        base_price: row.base_price,
+        currency: row.currency,
+        calories: row.calories,
+        protein_grams: row.protein_grams,
+        is_vegan: row.is_vegan,
+        is_vegetarian: row.is_vegetarian,
+        is_gluten_free: row.is_gluten_free,
+        is_low_calorie: row.is_low_calorie,
+        is_high_protein: row.is_high_protein,
+        estimated_prep_time_minutes: row.estimated_prep_time_minutes,
+      });
+    }
+  }
+  return [...categoriesById.values()];
+}
+
 /**
  * Fetch one meal, with its category name joined in.
  * @param {string} mealId

@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 
 import { apiClient } from '../api/client';
 import { getCurrentPosition } from '../api/geolocation';
 import { useGuestSession } from '../context/useGuestSession';
 import { applyRestaurantTheme } from '../theme';
+import Spinner from '../components/Spinner';
 
 const STAGE = {
   MISSING_CODE: 'missing_code',
@@ -27,12 +28,12 @@ const STAGE_MESSAGE = {
 // number, so this page's own job is just: extract that token, get the
 // guest's location, exchange both for a proximity-verified session
 // (POST /v1/tables/:qrCodeId/scan), then load enough of that session to
-// show the guest they're in the right place. Menu browsing/ordering is
-// intentionally not built here yet — there's nowhere for this page to
-// send a guest onward to.
+// show the guest they're in the right place, and send them on to
+// pages/MenuPage.jsx.
 export default function ScanPage() {
   const [searchParams] = useSearchParams();
   const code = searchParams.get('code');
+  const navigate = useNavigate();
   const { setSession } = useGuestSession();
 
   const [stage, setStage] = useState(code ? STAGE.LOCATING : STAGE.MISSING_CODE);
@@ -136,7 +137,9 @@ export default function ScanPage() {
                 You&apos;re being served by <span className="font-medium text-ink">{profile.server.name}</span>
               </p>
             )}
-            <p className="mt-sm text-xs text-ink-secondary">Menu browsing and ordering are coming soon.</p>
+            <button type="button" className="btn-primary mt-sm" onClick={() => navigate('/menu')}>
+              View Menu
+            </button>
           </div>
         )}
       </div>
@@ -156,12 +159,3 @@ function InfoCard({ tone, icon, title, children }) {
   );
 }
 
-function Spinner() {
-  return (
-    <div
-      className="h-10 w-10 animate-spin rounded-full border-4 border-brand-light border-t-brand"
-      role="status"
-      aria-label="Loading"
-    />
-  );
-}

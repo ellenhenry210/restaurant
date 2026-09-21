@@ -134,13 +134,19 @@ export async function insertOrderItem(item, executor = pool) {
   return result.rows[0];
 }
 
-/** @returns {Promise<object|null>} */
+/**
+ * @returns {Promise<object|null>} includes payment_status/payment_reference
+ *   — added 2026-09-18, previously missing here even though the payment
+ *   flow (paymentController.js) has written them since migration 010;
+ *   the guest-facing order-status page needs to know whether to show a
+ *   "Pay with Paystack" button.
+ */
 export async function findById(orderId, executor = pool) {
   const result = await executor.query(
     `SELECT id, restaurant_id, table_id, order_number, status,
             placed_at, confirmed_at, ready_at, served_at, cancelled_at,
             estimated_ready_time, subtotal, tax, service_charge, total_amount,
-            tip_amount, currency, special_requests
+            tip_amount, currency, special_requests, payment_status, payment_reference
      FROM orders
      WHERE id = $1`,
     [orderId]

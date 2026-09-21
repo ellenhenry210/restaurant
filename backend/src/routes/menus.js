@@ -10,6 +10,7 @@ import * as menuController from '../controllers/menuController.js';
 const router = Router();
 
 router.get('/restaurants/:restaurantId/menus', menuController.listMenus);
+router.get('/restaurants/:restaurantId/menus/:menuId/meals', menuController.listMenuMeals);
 router.get('/meals/:id', menuController.getMeal);
 router.get('/meals/:id/ingredients', menuController.getIngredients);
 

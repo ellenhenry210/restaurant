@@ -56,6 +56,33 @@ export async function getMeal(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// GET /restaurants/:restaurantId/menus/:menuId/meals — a menu's
+// categories, each with its available meals nested. Public, same
+// reasoning as listMenus/getMeal (view_menu has no ABAC condition).
+// Fills a real, previously-flagged gap: meals could only be fetched one
+// at a time by id, with no way to list what's actually on a menu.
+// ---------------------------------------------------------------------
+export async function listMenuMeals(req, res) {
+  const { restaurantId, menuId } = req.params;
+
+  try {
+    const menu = await menuModel.findMenuById(menuId, restaurantId);
+    if (!menu) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Menu not found' } });
+    }
+
+    const categories = await menuModel.findCategoriesWithMealsByMenu(menuId);
+    res.json({ id: menu.id, name: menu.name, description: menu.description, categories });
+  } catch (err) {
+    if (err.code === '22P02') {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Menu not found' } });
+    }
+    console.error('GET /restaurants/:restaurantId/menus/:menuId/meals: failed:', err.message);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load menu' } });
+  }
+}
+
 function validateCreateMealInput(body) {
   const errors = [];
   if (!body.category_id || typeof body.category_id !== 'string') {

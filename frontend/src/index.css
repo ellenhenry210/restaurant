@@ -112,4 +112,27 @@ body {
   .btn-secondary:hover {
     background: var(--color-surface);
   }
+
+  .input {
+    width: 100%;
+    min-height: 44px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: 12px;
+    font-size: 14px;
+    background: white;
+    color: var(--color-ink);
+  }
+  .input::placeholder {
+    color: #9ca3af;
+  }
+  .input:focus {
+    outline: none;
+    border: 2px solid var(--color-brand);
+    padding: 11px; /* keeps the box the same size once the border doubles */
+  }
+  textarea.input {
+    resize: vertical;
+    line-height: 1.5;
+  }
 }
