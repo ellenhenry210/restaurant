@@ -3,6 +3,7 @@ import { Server } from 'socket.io';
 import { verifyToken } from './auth.js';
 import { pool } from './db.js';
 import { roleGrants } from './authorization/permissions.js';
+import { logger } from './logger.js';
 
 // Module-level singleton, same pattern as db.js's `pool` — one Socket.io
 // server for the whole process, initialized once at startup (initRealtime,
@@ -82,7 +83,7 @@ async function handleConnection(socket) {
       socket.join(`table:${session.table_id}`);
       socket.emit('connected', { role: 'guest', table_id: session.table_id });
     } catch (err) {
-      console.error('realtime: guest connection failed:', err.message);
+      logger.error(`realtime: guest connection failed: ${err.message}`);
       socket.disconnect(true);
     }
     return;
@@ -98,7 +99,7 @@ async function handleConnection(socket) {
     socket.data.identity = { type: 'staff', userId: payload.sub };
     socket.emit('connected', { role: 'staff' });
   } catch (err) {
-    console.error('realtime: staff connection failed:', err.message);
+    logger.error(`realtime: staff connection failed: ${err.message}`);
     return socket.disconnect(true);
   }
 
@@ -132,7 +133,7 @@ async function handleConnection(socket) {
       socket.join(`staff:${restaurantId}`);
       ack?.({ ok: true, restaurant_id: restaurantId });
     } catch (err) {
-      console.error('realtime: join_staff failed:', err.message);
+      logger.error(`realtime: join_staff failed: ${err.message}`);
       ack?.({ ok: false, error: 'Failed to join' });
     }
   });
@@ -163,7 +164,7 @@ async function handleConnection(socket) {
       socket.join(`kitchen:${restaurantId}`);
       ack?.({ ok: true, restaurant_id: restaurantId });
     } catch (err) {
-      console.error('realtime: join_kitchen failed:', err.message);
+      logger.error(`realtime: join_kitchen failed: ${err.message}`);
       ack?.({ ok: false, error: 'Failed to join' });
     }
   });

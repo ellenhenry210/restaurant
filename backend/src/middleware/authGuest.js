@@ -1,5 +1,6 @@
 import { verifyToken } from '../auth.js';
 import { pool } from '../db.js';
+import { logger } from '../logger.js';
 
 /**
  * Authenticates a guest session token — the guest-side counterpart to
@@ -77,7 +78,7 @@ export async function authenticateGuest(req, res, next) {
     req.guestSession = session;
     next();
   } catch (err) {
-    console.error('authenticateGuest: session lookup failed:', err.message);
+    logger.error(`authenticateGuest: session lookup failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to authenticate request' } });
   }
 }

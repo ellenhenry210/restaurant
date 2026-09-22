@@ -1,6 +1,7 @@
 import { Router } from 'express';
 
 import { authenticateGuest } from '../middleware/authGuest.js';
+import { validate } from '../middleware/validate.js';
 import * as orderController from '../controllers/orderController.js';
 import * as paymentController from '../controllers/paymentController.js';
 
@@ -10,8 +11,9 @@ import * as paymentController from '../controllers/paymentController.js';
 // models/orderModel.js for the actual queries.
 const router = Router();
 
-router.post('/', authenticateGuest, orderController.create);
+router.post('/', authenticateGuest, validate(orderController.createOrderSchema), orderController.create);
 router.get('/:id', authenticateGuest, orderController.getStatus);
+router.patch('/:id/cancel', authenticateGuest, orderController.cancel);
 
 // Payment on an order the guest already placed — same ownership model as
 // GET /:id above (table-based, via req.guestSession), not a separate

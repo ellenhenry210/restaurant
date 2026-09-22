@@ -1,6 +1,7 @@
 import { pool } from '../db.js';
 import { roleGrants } from '../authorization/permissions.js';
 import { logAudit } from '../audit.js';
+import { logger } from '../logger.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -73,13 +74,13 @@ export function authorize(permissionKey, options = {}) {
       // A route wired authorize() without authenticate() before it —
       // that's a bug in how the route is set up, not something a client
       // did wrong.
-      console.error(`authorize('${permissionKey}'): req.user is not set — authenticate() must run first.`);
+      logger.error(`authorize('${permissionKey}'): req.user is not set — authenticate() must run first.`);
       return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Server misconfiguration' } });
     }
 
     const restaurantId = req.params[restaurantIdParam];
     if (!restaurantId) {
-      console.error(`authorize('${permissionKey}'): no :${restaurantIdParam} param on this route.`);
+      logger.error(`authorize('${permissionKey}'): no :${restaurantIdParam} param on this route.`);
       return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Server misconfiguration' } });
     }
     if (!UUID_RE.test(restaurantId)) {
@@ -110,7 +111,7 @@ export function authorize(permissionKey, options = {}) {
       );
       staff = result.rows[0];
     } catch (err) {
-      console.error('authorize: staff lookup failed:', err.message);
+      logger.error(`authorize: staff lookup failed: ${err.message}`);
       return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to authorize request' } });
     }
 
@@ -129,7 +130,7 @@ export function authorize(permissionKey, options = {}) {
       try {
         allowed = await abac(staff, req);
       } catch (err) {
-        console.error('authorize: abac check threw:', err.message);
+        logger.error(`authorize: abac check threw: ${err.message}`);
         return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to authorize request' } });
       }
       if (!allowed) {

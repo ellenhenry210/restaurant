@@ -1,12 +1,18 @@
 import crypto from 'node:crypto';
+import { z } from 'zod';
 
 import { pool } from '../db.js';
 import * as billModel from '../models/billModel.js';
 import { initializeTransaction } from '../paystack.js';
 import { emitWaiterCalled } from '../realtime.js';
+import { logger } from '../logger.js';
 
 const TIMINGS = ['pay_now', 'pay_after', 'pay_traditional'];
 const NON_PAYABLE_BILL_STATUSES = ['split_requested', 'paid', 'settled_traditionally', 'cancelled'];
+
+export const createBillSchema = z.object({
+  timing: z.enum(TIMINGS, { message: `timing must be one of: ${TIMINGS.join(', ')}` }),
+});
 
 function billOwnedBySession(bill, guestSession) {
   return bill.sitting_id === guestSession.sitting_id;
@@ -18,15 +24,11 @@ function billOwnedBySession(bill, guestSession) {
 // sitting returns the existing bill rather than creating another (bills
 // has a UNIQUE(sitting_id) constraint, so a naive re-insert would just
 // fail — this checks first instead of relying on that to reject it).
+// Body shape already validated by validate(createBillSchema) in
+// routes/bills.js.
 // ---------------------------------------------------------------------
 export async function create(req, res) {
-  const { timing } = req.body ?? {};
-  if (!TIMINGS.includes(timing)) {
-    return res.status(400).json({
-      error: { code: 'INVALID_REQUEST', message: `timing must be one of: ${TIMINGS.join(', ')}` },
-    });
-  }
-
+  const { timing } = req.body;
   const { sitting_id: sittingId, restaurant_id: restaurantId, table_id: tableId } = req.guestSession;
   if (!sittingId) {
     // A session issued before this feature existed (or, in principle, a
@@ -86,13 +88,13 @@ export async function create(req, res) {
       try {
         emitWaiterCalled(restaurantId, { table_id: tableId, bill_id: bill.id, reason: 'payment' });
       } catch (err) {
-        console.error('emitWaiterCalled failed (bill/staff call were still created successfully):', err.message);
+        logger.error(`emitWaiterCalled failed (bill/staff call were still created successfully): ${err.message}`);
       }
     }
 
     res.status(201).json(bill);
   } catch (err) {
-    console.error('POST /guest/session/bill: failed:', err.message);
+    logger.error(`POST /guest/session/bill: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to create bill' } });
   }
 }
@@ -114,7 +116,7 @@ export async function getOne(req, res) {
     if (err.code === '22P02') {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Bill not found' } });
     }
-    console.error('GET /guest/session/bill/:billId: failed:', err.message);
+    logger.error(`GET /guest/session/bill/:billId: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load bill' } });
   }
 }
@@ -134,44 +136,43 @@ function computeEvenShares(totalAmount, numParties) {
   }));
 }
 
-function validateSplitInput(body) {
-  const errors = [];
-  if (!['even', 'custom'].includes(body.split_type)) {
-    errors.push({ field: 'split_type', reason: "must be 'even' or 'custom'" });
-  }
-  if (!Number.isInteger(body.num_parties) || body.num_parties < 2) {
-    errors.push({ field: 'num_parties', reason: 'must be an integer of 2 or more' });
-  }
-  if (body.split_type === 'custom') {
-    if (!Array.isArray(body.shares) || body.shares.length !== body.num_parties) {
-      errors.push({ field: 'shares', reason: 'required for a custom split, with exactly num_parties entries' });
-    } else {
-      body.shares.forEach((share, i) => {
-        if (!share.guest_label || typeof share.guest_label !== 'string') {
-          errors.push({ field: `shares[${i}].guest_label`, reason: 'required' });
-        }
-        if (typeof share.amount_owed !== 'number' || share.amount_owed <= 0) {
-          errors.push({ field: `shares[${i}].amount_owed`, reason: 'must be a positive number' });
-        }
+// shares is only required (and length-checked against num_parties) for
+// a 'custom' split — a cross-field rule, hence the superRefine rather
+// than a plain per-key schema.
+export const requestSplitSchema = z
+  .object({
+    split_type: z.enum(['even', 'custom'], { message: "must be 'even' or 'custom'" }),
+    num_parties: z.number().int('must be an integer of 2 or more').min(2, 'must be an integer of 2 or more'),
+    shares: z
+      .array(
+        z.object({
+          guest_label: z.string().min(1, 'required'),
+          amount_owed: z.number().positive('must be a positive number'),
+        })
+      )
+      .optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.split_type === 'custom' && (!Array.isArray(data.shares) || data.shares.length !== data.num_parties)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['shares'],
+        message: 'required for a custom split, with exactly num_parties entries',
       });
     }
-  }
-  return errors;
-}
+  });
 
 // ---------------------------------------------------------------------
 // POST /bills/:billId/request-split — the only path that creates a
 // split; nothing does this automatically. Moves the bill's status to
 // 'split_requested', which the payment-initialize endpoints below check
-// to enforce "once split, pay per-share, not as a whole" (409).
+// to enforce "once split, pay per-share, not as a whole" (409). Body
+// shape already validated by validate(requestSplitSchema) in
+// routes/bills.js.
 // ---------------------------------------------------------------------
 export async function requestSplit(req, res) {
   const { billId } = req.params;
-  const body = req.body ?? {};
-  const errors = validateSplitInput(body);
-  if (errors.length > 0) {
-    return res.status(400).json({ error: { code: 'INVALID_REQUEST', message: 'One or more fields are invalid', details: errors } });
-  }
+  const body = req.body;
 
   try {
     const bill = await billModel.findById(billId);
@@ -233,7 +234,7 @@ export async function requestSplit(req, res) {
     if (err.code === '23505') {
       return res.status(409).json({ error: { code: 'CONFLICT', message: 'A split has already been requested for this bill' } });
     }
-    console.error('POST /bills/:billId/request-split: failed:', err.message);
+    logger.error(`POST /bills/:billId/request-split: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to request split' } });
   }
 }
@@ -261,7 +262,7 @@ export async function getSplits(req, res) {
     if (err.code === '22P02') {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Bill not found' } });
     }
-    console.error('GET /bills/:billId/splits: failed:', err.message);
+    logger.error(`GET /bills/:billId/splits: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load splits' } });
   }
 }
@@ -347,7 +348,7 @@ export async function initializeBillPayment(req, res) {
     if (err.code === '22P02') {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Bill not found' } });
     }
-    console.error('POST /bills/:billId/payments/initialize: failed:', err.message);
+    logger.error(`POST /bills/:billId/payments/initialize: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to initialize payment' } });
   }
 }
@@ -420,7 +421,7 @@ export async function initializeSharePayment(req, res) {
     if (err.code === '22P02') {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Share not found' } });
     }
-    console.error('POST /bills/splits/:shareId/payments/initialize: failed:', err.message);
+    logger.error(`POST /bills/splits/:shareId/payments/initialize: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to initialize payment' } });
   }
 }

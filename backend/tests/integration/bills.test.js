@@ -175,6 +175,37 @@ describe('POST /v1/bills/:billId/request-split', () => {
   });
 });
 
+describe('GET /v1/bills/:billId/splits', () => {
+  async function createBill(timing = 'pay_now', orderOverrides) {
+    const ctx = await setUpSittingWithOrders(orderOverrides);
+    const created = await request(app).post('/v1/guest/session/bill').set('Authorization', `Bearer ${ctx.guest.token}`).send({ timing });
+    return { ...ctx, bill: created.body };
+  }
+
+  // Regression test — bill_split_shares has no created_at column, but
+  // findSharesBySplit's ORDER BY once referenced one, 500ing every call
+  // to this endpoint. Found manually while wiring BillPage.jsx's split
+  // UI to the real API for the first time.
+  it('returns the split with its shares once one has been requested', async () => {
+    const { guest, bill } = await createBill();
+    await request(app)
+      .post(`/v1/bills/${bill.id}/request-split`)
+      .set('Authorization', `Bearer ${guest.token}`)
+      .send({ split_type: 'even', num_parties: 2 });
+
+    const res = await request(app).get(`/v1/bills/${bill.id}/splits`).set('Authorization', `Bearer ${guest.token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.shares).toHaveLength(2);
+  });
+
+  it('returns 404 when no split has been requested for this bill', async () => {
+    const { guest, bill } = await createBill();
+    const res = await request(app).get(`/v1/bills/${bill.id}/splits`).set('Authorization', `Bearer ${guest.token}`);
+    expect(res.status).toBe(404);
+  });
+});
+
 describe('POST /v1/bills/:billId/payments/initialize', () => {
   async function createBill(timing = 'pay_now', orderOverrides) {
     const ctx = await setUpSittingWithOrders(orderOverrides);

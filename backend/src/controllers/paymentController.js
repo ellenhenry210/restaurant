@@ -4,6 +4,7 @@ import { pool } from '../db.js';
 import * as paymentModel from '../models/paymentModel.js';
 import * as billModel from '../models/billModel.js';
 import { initializeTransaction, verifyWebhookSignature } from '../paystack.js';
+import { logger } from '../logger.js';
 
 // ---------------------------------------------------------------------
 // POST /v1/orders/:id/payments/initialize
@@ -68,7 +69,7 @@ export async function initialize(req, res) {
     if (err.code === '22P02') {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });
     }
-    console.error('POST /orders/:id/payments/initialize: failed:', err.message);
+    logger.error(`POST /orders/:id/payments/initialize: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to initialize payment' } });
   }
 }
@@ -91,7 +92,7 @@ export async function handleWebhook(req, res) {
   const signature = req.headers['x-paystack-signature'];
 
   if (!Buffer.isBuffer(req.body) || !verifyWebhookSignature(req.body, signature)) {
-    console.error('POST /payments/webhook: invalid signature — rejecting');
+    logger.error('POST /payments/webhook: invalid signature — rejecting');
     return res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid webhook signature' } });
   }
 
@@ -112,7 +113,7 @@ export async function handleWebhook(req, res) {
   try {
     const transaction = await paymentModel.findTransactionByReference(reference);
     if (!transaction) {
-      console.error(`POST /payments/webhook: no transaction for reference ${reference}`);
+      logger.error(`POST /payments/webhook: no transaction for reference ${reference}`);
       return res.sendStatus(200);
     }
 
@@ -147,7 +148,7 @@ export async function handleWebhook(req, res) {
 
     res.sendStatus(200);
   } catch (err) {
-    console.error('POST /payments/webhook: failed to process event:', err.message);
+    logger.error(`POST /payments/webhook: failed to process event: ${err.message}`);
     // 500 here is correct (not a swallowed 200) — Paystack will retry,
     // and this really did fail to persist.
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to process webhook' } });

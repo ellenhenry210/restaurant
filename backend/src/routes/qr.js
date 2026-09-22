@@ -12,5 +12,6 @@ import * as qrController from '../controllers/qrController.js';
 const router = Router();
 
 router.get('/:restaurantId/:tableNumber', authenticate, authorize('manage_tables'), qrController.getTableQr);
+router.post('/:restaurantId/:tableNumber/rotate', authenticate, authorize('manage_tables'), qrController.rotateTableQr);
 
 export default router;

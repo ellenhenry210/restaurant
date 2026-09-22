@@ -2,7 +2,7 @@ import request from 'supertest';
 
 import app from '../../src/app.js';
 import { resetDb, closeDb } from '../helpers/db.js';
-import { createRestaurant, createStaff, createMenuWithMeal } from '../helpers/fixtures.js';
+import { createRestaurant, createStaff, createMenuWithMeal, createTable, createGuestSession } from '../helpers/fixtures.js';
 
 afterEach(resetDb);
 afterAll(closeDb);
@@ -50,6 +50,15 @@ describe('GET /v1/restaurants/:restaurantId/menus/:menuId/meals', () => {
 
     const res = await request(app).get(`/v1/restaurants/${restaurantId}/menus/${menuId}/meals`);
     expect(res.status).toBe(404);
+  });
+
+  it('include_unavailable=true surfaces an out-of-stock meal (for the admin menu editor)', async () => {
+    const restaurantId = await createRestaurant();
+    const { menuId, mealId } = await createMenuWithMeal(restaurantId, { isAvailable: false });
+
+    const res = await request(app).get(`/v1/restaurants/${restaurantId}/menus/${menuId}/meals?include_unavailable=true`);
+    expect(res.body.categories[0].meals).toHaveLength(1);
+    expect(res.body.categories[0].meals[0]).toMatchObject({ id: mealId, is_available: false });
   });
 });
 
@@ -114,5 +123,29 @@ describe('POST /v1/restaurants/:restaurantId/meals', () => {
     expect(res.body.error.details).toEqual(
       expect.arrayContaining([expect.objectContaining({ field: 'category_id' }), expect.objectContaining({ field: 'name' }), expect.objectContaining({ field: 'base_price' })])
     );
+  });
+});
+
+describe('GET /v1/restaurants/:restaurantId/recommendations', () => {
+  it('filters by tag and ranks by popularity', async () => {
+    const restaurantId = await createRestaurant();
+    const table = await createTable(restaurantId, 1);
+    const vegan = await createMenuWithMeal(restaurantId, { name: 'Vegan Bowl', isVegan: true });
+    const nonVegan = await createMenuWithMeal(restaurantId, { name: 'Beef Stew', isVegan: false });
+    const guest = await createGuestSession(restaurantId, table.id, { phoneNumber: '+2348012345678' });
+    await request(app).post('/v1/orders').set('Authorization', `Bearer ${guest.token}`).send({ phone_number: '+2348012345678', items: [{ meal_id: nonVegan.mealId, quantity: 5 }] });
+
+    const res = await request(app).get(`/v1/restaurants/${restaurantId}/recommendations?tags=vegan`);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].id).toBe(vegan.mealId);
+  });
+
+  it('excludes unavailable meals', async () => {
+    const restaurantId = await createRestaurant();
+    await createMenuWithMeal(restaurantId, { isAvailable: false });
+
+    const res = await request(app).get(`/v1/restaurants/${restaurantId}/recommendations`);
+    expect(res.body.data).toHaveLength(0);
   });
 });

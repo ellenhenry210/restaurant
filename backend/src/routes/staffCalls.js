@@ -2,6 +2,7 @@ import { Router } from 'express';
 
 import { authenticate } from '../middleware/auth.js';
 import { authorize } from '../middleware/authorize.js';
+import { validate } from '../middleware/validate.js';
 import * as staffCallController from '../controllers/staffCallController.js';
 
 // mergeParams: true — mounted at /v1/restaurants/:restaurantId/staff-calls,
@@ -13,6 +14,12 @@ import * as staffCallController from '../controllers/staffCallController.js';
 const router = Router({ mergeParams: true });
 
 router.get('/', authenticate, authorize('process_payment'), staffCallController.list);
-router.patch('/:callId', authenticate, authorize('process_payment'), staffCallController.updateStatus);
+router.patch(
+  '/:callId',
+  authenticate,
+  authorize('process_payment'),
+  validate(staffCallController.updateStatusSchema),
+  staffCallController.updateStatus
+);
 
 export default router;

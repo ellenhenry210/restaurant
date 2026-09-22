@@ -1,4 +1,5 @@
 import * as restaurantModel from '../models/restaurantModel.js';
+import { logger } from '../logger.js';
 
 // ---------------------------------------------------------------------
 // GET /restaurants — list active restaurants. Public: no authenticate/
@@ -25,7 +26,7 @@ export async function list(req, res) {
       pagination: { total, page, per_page: perPage },
     });
   } catch (err) {
-    console.error('GET /restaurants: failed:', err.message);
+    logger.error(`GET /restaurants: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to list restaurants' } });
   }
 }
@@ -54,7 +55,7 @@ export async function getOne(req, res) {
     if (err.code === '22P02') {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Restaurant not found' } });
     }
-    console.error('GET /restaurants/:id: failed:', err.message);
+    logger.error(`GET /restaurants/:id: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load restaurant' } });
   }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams, Link } from 'react-router-dom';
 import { io } from 'socket.io-client';
 
 import { apiClient } from '../api/client';
@@ -147,17 +147,24 @@ export default function OrderStatusPage() {
         </p>
       )}
 
-      <div className="mt-lg">
+      <div className="mt-lg flex flex-col gap-sm">
         {order.payment_status === 'completed' ? (
           <div className="rounded-md border-l-4 border-brand bg-brand-light p-md text-[13px] text-[#047857]">✅ Payment received</div>
         ) : (
           <>
             <button type="button" className="btn-primary" onClick={handlePay} disabled={payState === 'initializing'}>
-              {payState === 'initializing' ? 'Starting payment…' : 'Pay with Paystack'}
+              {payState === 'initializing' ? 'Starting payment…' : 'Pay for this order only'}
             </button>
             {payError && <p className="mt-sm text-xs text-danger">{payError}</p>}
           </>
         )}
+        {/* The table-level bill (sittings -> bills) — the recommended
+            path once more than one order is on the table, or a split is
+            wanted: one consolidated bill by default, split only on
+            request, plus Pay Now / Pay After / Pay Traditionally. */}
+        <Link to="/bill" className="btn-secondary text-center">
+          View table bill
+        </Link>
       </div>
     </main>
   );

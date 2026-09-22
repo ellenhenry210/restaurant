@@ -1,9 +1,12 @@
 import { Router } from 'express';
+import { z } from 'zod';
 
 import { pool } from '../db.js';
 import { authenticate } from '../middleware/auth.js';
 import { authorize } from '../middleware/authorize.js';
+import { validate } from '../middleware/validate.js';
 import { emitOrderStatusUpdate, emitItemStatusUpdate } from '../realtime.js';
+import { logger } from '../logger.js';
 
 // mergeParams: true — mounted at /v1/restaurants/:restaurantId/orders,
 // needs that :restaurantId in its own req.params (see routes/staff.js
@@ -41,6 +44,22 @@ const VALID_ITEM_TRANSITIONS = {
   cancelled: [],
 };
 
+// Only checks "is this a real status at all" — the state-machine rule
+// (which transitions from the CURRENT status are legal) needs a DB read
+// first, so it stays a 409 check in the handler, not something a schema
+// can validate statically.
+const orderStatusSchema = z.object({
+  status: z.enum(Object.keys(VALID_ORDER_TRANSITIONS), {
+    message: `status must be one of: ${Object.keys(VALID_ORDER_TRANSITIONS).join(', ')}`,
+  }),
+});
+
+const itemStatusSchema = z.object({
+  status: z.enum(Object.keys(VALID_ITEM_TRANSITIONS), {
+    message: `status must be one of: ${Object.keys(VALID_ITEM_TRANSITIONS).join(', ')}`,
+  }),
+});
+
 // ---------------------------------------------------------------------
 // GET / — list a restaurant's orders. view_all_orders covers waiter,
 // kitchen_staff, manager, owner, system_admin per the matrix — a
@@ -57,20 +76,68 @@ router.get('/', authenticate, authorize('view_all_orders'), async (req, res) => 
 
   try {
     const result = await pool.query(
-      `SELECT id, table_id, order_number, status,
-              placed_at, confirmed_at, ready_at, served_at, cancelled_at,
-              subtotal, tax, service_charge, total_amount, tip_amount,
-              special_requests, allergen_warnings
-       FROM orders
-       WHERE restaurant_id = $1
-         AND ($2::text[] IS NULL OR status = ANY($2::text[]))
-       ORDER BY placed_at ASC`,
+      `SELECT o.id, o.table_id, t.table_number, o.order_number, o.status,
+              o.placed_at, o.confirmed_at, o.ready_at, o.served_at, o.cancelled_at,
+              o.subtotal, o.tax, o.service_charge, o.total_amount, o.tip_amount,
+              o.special_requests, o.allergen_warnings
+       FROM orders o
+       JOIN tables t ON t.id = o.table_id
+       WHERE o.restaurant_id = $1
+         AND ($2::text[] IS NULL OR o.status = ANY($2::text[]))
+       ORDER BY o.placed_at ASC`,
       [restaurantId, statusFilter]
     );
     res.json({ data: result.rows });
   } catch (err) {
-    console.error('GET /restaurants/:restaurantId/orders: failed:', err.message);
+    logger.error(`GET /restaurants/:restaurantId/orders: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to list orders' } });
+  }
+});
+
+// ---------------------------------------------------------------------
+// GET /:orderId — one order's full detail, items included. Missing
+// until now: the KDS/staff order views had a list (order-level fields
+// only) and could change an item's status, but nothing to actually see
+// which items an in-progress order has when the page first loads (the
+// realtime new_order event carries items, but only for orders placed
+// AFTER the page connected — a kitchen display that's opened once per
+// shift needs this for whatever's already in flight).
+// ---------------------------------------------------------------------
+router.get('/:orderId', authenticate, authorize('view_all_orders'), async (req, res) => {
+  const { restaurantId, orderId } = req.params;
+
+  try {
+    const orderResult = await pool.query(
+      `SELECT o.id, o.table_id, t.table_number, o.order_number, o.status,
+              o.placed_at, o.confirmed_at, o.ready_at, o.served_at, o.cancelled_at,
+              o.subtotal, o.tax, o.service_charge, o.total_amount, o.tip_amount,
+              o.special_requests, o.allergen_warnings
+       FROM orders o
+       JOIN tables t ON t.id = o.table_id
+       WHERE o.id = $1 AND o.restaurant_id = $2`,
+      [orderId, restaurantId]
+    );
+    const order = orderResult.rows[0];
+    if (!order) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });
+    }
+
+    const itemsResult = await pool.query(
+      `SELECT id, meal_id, meal_name, meal_price, quantity, status, special_request,
+              removed_ingredients, allergen_caution_acknowledged, added_addons
+       FROM order_items
+       WHERE order_id = $1
+       ORDER BY created_at ASC`,
+      [orderId]
+    );
+
+    res.json({ ...order, items: itemsResult.rows });
+  } catch (err) {
+    if (err.code === '22P02') {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });
+    }
+    logger.error(`GET /restaurants/:restaurantId/orders/:orderId: failed: ${err.message}`);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load order' } });
   }
 });
 
@@ -86,15 +153,9 @@ router.get('/', authenticate, authorize('view_all_orders'), async (req, res) => 
 // to be revisited — noted here so that divergence doesn't silently
 // become a bug.
 // ---------------------------------------------------------------------
-router.patch('/:orderId/status', authenticate, authorize('modify_order'), async (req, res) => {
+router.patch('/:orderId/status', authenticate, authorize('modify_order'), validate(orderStatusSchema), async (req, res) => {
   const { restaurantId, orderId } = req.params;
-  const { status: nextStatus } = req.body ?? {};
-
-  if (typeof nextStatus !== 'string' || !(nextStatus in VALID_ORDER_TRANSITIONS)) {
-    return res.status(400).json({
-      error: { code: 'INVALID_REQUEST', message: `status must be one of: ${Object.keys(VALID_ORDER_TRANSITIONS).join(', ')}` },
-    });
-  }
+  const { status: nextStatus } = req.body;
 
   try {
     const currentResult = await pool.query(
@@ -132,12 +193,12 @@ router.patch('/:orderId/status', authenticate, authorize('modify_order'), async 
     try {
       emitOrderStatusUpdate(restaurantId, current.table_id, { order_id: updated.id, status: updated.status });
     } catch (err) {
-      console.error('emitOrderStatusUpdate failed (status update itself still succeeded):', err.message);
+      logger.error(`emitOrderStatusUpdate failed (status update itself still succeeded): ${err.message}`);
     }
 
     res.json(updated);
   } catch (err) {
-    console.error('PATCH /restaurants/:restaurantId/orders/:orderId/status: failed:', err.message);
+    logger.error(`PATCH /restaurants/:restaurantId/orders/:orderId/status: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update order status' } });
   }
 });
@@ -153,15 +214,10 @@ router.patch(
   '/:orderId/items/:itemId/status',
   authenticate,
   authorize('update_kitchen_item_status'),
+  validate(itemStatusSchema),
   async (req, res) => {
     const { restaurantId, orderId, itemId } = req.params;
-    const { status: nextStatus } = req.body ?? {};
-
-    if (typeof nextStatus !== 'string' || !(nextStatus in VALID_ITEM_TRANSITIONS)) {
-      return res.status(400).json({
-        error: { code: 'INVALID_REQUEST', message: `status must be one of: ${Object.keys(VALID_ITEM_TRANSITIONS).join(', ')}` },
-      });
-    }
+    const { status: nextStatus } = req.body;
 
     try {
       // Join through orders to confirm the item actually belongs to a
@@ -207,12 +263,12 @@ router.patch(
       try {
         emitItemStatusUpdate(restaurantId, current.table_id, { order_id: orderId, item_id: updated.id, status: updated.status });
       } catch (err) {
-        console.error('emitItemStatusUpdate failed (status update itself still succeeded):', err.message);
+        logger.error(`emitItemStatusUpdate failed (status update itself still succeeded): ${err.message}`);
       }
 
       res.json(updated);
     } catch (err) {
-      console.error('PATCH .../items/:itemId/status: failed:', err.message);
+      logger.error(`PATCH .../items/:itemId/status: failed: ${err.message}`);
       res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update item status' } });
     }
   }

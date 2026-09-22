@@ -1,5 +1,6 @@
 import { verifyToken } from '../auth.js';
 import { pool } from '../db.js';
+import { logger } from '../logger.js';
 
 /**
  * Express middleware that authenticates a request via a JWT and attaches
@@ -79,7 +80,7 @@ export async function authenticate(req, res, next) {
     req.user = user;
     next();
   } catch (err) {
-    console.error('authenticate: user lookup failed:', err.message);
+    logger.error(`authenticate: user lookup failed: ${err.message}`);
     res.status(500).json({
       error: { code: 'INTERNAL_ERROR', message: 'Failed to authenticate request' },
     });

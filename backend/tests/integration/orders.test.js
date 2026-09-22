@@ -125,3 +125,46 @@ describe('GET /v1/orders/:id', () => {
     expect(res.body.payment_status).toBe('pending');
   });
 });
+
+describe('PATCH /v1/orders/:id/cancel', () => {
+  it('rejects a guest cancelling an order from a different table', async () => {
+    const { mealId, guest, restaurantId } = await setUp();
+    const created = await request(app)
+      .post('/v1/orders')
+      .set('Authorization', `Bearer ${guest.token}`)
+      .send({ phone_number: '+2348012345678', items: [{ meal_id: mealId, quantity: 1 }] });
+
+    const otherTable = await createTable(restaurantId, 2);
+    const otherGuest = await createGuestSession(restaurantId, otherTable.id, { phoneNumber: '+2348099999999' });
+
+    const res = await request(app).patch(`/v1/orders/${created.body.id}/cancel`).set('Authorization', `Bearer ${otherGuest.token}`);
+    expect(res.status).toBe(403);
+  });
+
+  it('cancels a placed order', async () => {
+    const { mealId, guest } = await setUp();
+    const created = await request(app)
+      .post('/v1/orders')
+      .set('Authorization', `Bearer ${guest.token}`)
+      .send({ phone_number: '+2348012345678', items: [{ meal_id: mealId, quantity: 1 }] });
+
+    const res = await request(app).patch(`/v1/orders/${created.body.id}/cancel`).set('Authorization', `Bearer ${guest.token}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('cancelled');
+  });
+
+  it('rejects cancelling an order that is already preparing', async () => {
+    const { mealId, guest, restaurantId } = await setUp();
+    const created = await request(app)
+      .post('/v1/orders')
+      .set('Authorization', `Bearer ${guest.token}`)
+      .send({ phone_number: '+2348012345678', items: [{ meal_id: mealId, quantity: 1 }] });
+
+    const manager = await (await import('../helpers/fixtures.js')).createStaff(restaurantId, 'manager');
+    await request(app).patch(`/v1/restaurants/${restaurantId}/orders/${created.body.id}/status`).set('Authorization', `Bearer ${manager.token}`).send({ status: 'confirmed' });
+    await request(app).patch(`/v1/restaurants/${restaurantId}/orders/${created.body.id}/status`).set('Authorization', `Bearer ${manager.token}`).send({ status: 'preparing' });
+
+    const res = await request(app).patch(`/v1/orders/${created.body.id}/cancel`).set('Authorization', `Bearer ${guest.token}`);
+    expect(res.status).toBe(409);
+  });
+});

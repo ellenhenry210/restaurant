@@ -1,32 +1,34 @@
+import { z } from 'zod';
+
 import { pool } from '../db.js';
 import * as orderModel from '../models/orderModel.js';
-import { emitNewOrder } from '../realtime.js';
+import * as billModel from '../models/billModel.js';
+import { emitNewOrder, emitOrderStatusUpdate } from '../realtime.js';
+import { logger } from '../logger.js';
 
-function validateCreateOrderInput(body) {
-  const errors = [];
-  if (!body.phone_number || typeof body.phone_number !== 'string') {
-    errors.push({ field: 'phone_number', reason: 'required' });
-  }
-  if (!Array.isArray(body.items) || body.items.length === 0) {
-    errors.push({ field: 'items', reason: 'must be a non-empty array' });
-  } else {
-    body.items.forEach((item, i) => {
-      if (!item.meal_id || typeof item.meal_id !== 'string') {
-        errors.push({ field: `items[${i}].meal_id`, reason: 'required' });
-      }
-      if (!Number.isInteger(item.quantity) || item.quantity < 1) {
-        errors.push({ field: `items[${i}].quantity`, reason: 'must be a positive integer' });
-      }
-    });
-  }
+// Replaces the previous hand-rolled validateCreateOrderInput — see
+// SNAPORDER_STATUS.md, "no input validation library" was a flagged gap.
+export const createOrderSchema = z.object({
+  phone_number: z.string().min(1, 'required'),
+  guest_name: z.string().optional(),
+  items: z
+    .array(
+      z.object({
+        meal_id: z.string().min(1, 'required'),
+        quantity: z.number().int('must be a positive integer').positive('must be a positive integer'),
+        removed_ingredients: z.array(z.string()).optional(),
+        allergen_caution_acknowledged: z.boolean().optional(),
+        added_addons: z.array(z.string()).optional(),
+        special_request: z.string().optional(),
+      })
+    )
+    .min(1, 'must be a non-empty array'),
+  special_requests: z.string().optional(),
   // Optional — tipping is guest-initiated and entirely at their
   // discretion, so it's simply absent (not 0, not required) unless
   // they choose to include it.
-  if (body.tip_amount !== undefined && (typeof body.tip_amount !== 'number' || body.tip_amount < 0)) {
-    errors.push({ field: 'tip_amount', reason: 'must be a non-negative number' });
-  }
-  return errors;
-}
+  tip_amount: z.number().nonnegative('must be a non-negative number').optional(),
+});
 
 // ---------------------------------------------------------------------
 // POST /orders — create a new order. Behind authenticateGuest: only a
@@ -39,16 +41,10 @@ function validateCreateOrderInput(body) {
 // of them is called with `client` as the executor so the whole flow
 // (guest_profile lookup/creation through to inserting the order and its
 // items) runs as one transaction — nothing is written unless every item
-// validates.
+// validates. Body shape is already validated by validate(createOrderSchema)
+// in routes/orders.js by the time this runs.
 // ---------------------------------------------------------------------
 export async function create(req, res) {
-  const errors = validateCreateOrderInput(req.body ?? {});
-  if (errors.length > 0) {
-    return res.status(400).json({
-      error: { code: 'INVALID_REQUEST', message: 'One or more fields are invalid', details: errors },
-    });
-  }
-
   const { phone_number, guest_name, items, special_requests, tip_amount: tipAmount } = req.body;
   const { restaurant_id: restaurantId, table_id: tableId, sitting_id: sittingId } = req.guestSession;
 
@@ -77,6 +73,14 @@ export async function create(req, res) {
     // but the same underlying guest_profile via phone_number).
     if (!req.guestSession.guest_profile_id) {
       await orderModel.linkGuestSessionToProfile(req.guestSession.id, guestProfileId, client);
+    }
+
+    // Guest history capture (SNAPORDER_STATUS.md's "Guest identity
+    // capture" gap) — a visit starts the moment the first order in a
+    // sitting is placed. Idempotent (ON CONFLICT on sitting_id), so a
+    // second order in the same sitting is a no-op here, not a duplicate.
+    if (sittingId) {
+      await billModel.upsertGuestVisit(sittingId, restaurantId, guestProfileId, client);
     }
 
     // Validate and price every item BEFORE inserting anything — a
@@ -254,16 +258,65 @@ export async function create(req, res) {
         placed_at: order.placed_at,
       });
     } catch (err) {
-      console.error('emitNewOrder failed (order was still created successfully):', err.message);
+      logger.error(`emitNewOrder failed (order was still created successfully): ${err.message}`);
     }
 
     res.status(201).json({ ...order, grand_total: grandTotal, items: insertedItems });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('POST /orders: failed:', err.message);
+    logger.error(`POST /orders: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to create order' } });
   } finally {
     client.release();
+  }
+}
+
+// A guest can only cancel their own order before the kitchen has
+// started on it — the ABAC condition from SNAPORDER_AUTHORIZATION.md
+// Part 2 #5 ("cancel_order" is guest-grantable, but state-gated). Once
+// 'preparing', only staff can cancel (restaurantOrders.js's PATCH
+// .../status, which allows preparing -> cancelled) — that's a genuinely
+// different action with genuinely different consequences (food/labor
+// already committed), not something this endpoint should also permit.
+const GUEST_CANCELLABLE_STATUSES = ['placed', 'confirmed'];
+
+// ---------------------------------------------------------------------
+// PATCH /orders/:id/cancel — guest self-service cancellation. Same
+// ownership model as getStatus below (table-based, via req.guestSession).
+// ---------------------------------------------------------------------
+export async function cancel(req, res) {
+  try {
+    const order = await orderModel.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });
+    }
+    if (order.table_id !== req.guestSession.table_id || order.restaurant_id !== req.guestSession.restaurant_id) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'This order does not belong to your table' } });
+    }
+    if (!GUEST_CANCELLABLE_STATUSES.includes(order.status)) {
+      return res.status(409).json({
+        error: {
+          code: 'CONFLICT',
+          message: `This order can no longer be cancelled — it's already '${order.status}'. Ask a member of staff for help.`,
+        },
+      });
+    }
+
+    const updated = await orderModel.cancelOrder(order.id);
+
+    try {
+      emitOrderStatusUpdate(order.restaurant_id, order.table_id, { order_id: updated.id, status: updated.status });
+    } catch (err) {
+      logger.error(`emitOrderStatusUpdate failed (cancellation itself still succeeded): ${err.message}`);
+    }
+
+    res.json(updated);
+  } catch (err) {
+    if (err.code === '22P02') {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });
+    }
+    logger.error(`PATCH /orders/:id/cancel: failed: ${err.message}`);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to cancel order' } });
   }
 }
 
@@ -305,7 +358,7 @@ export async function getStatus(req, res) {
     if (err.code === '22P02') {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });
     }
-    console.error('GET /orders/:id: failed:', err.message);
+    logger.error(`GET /orders/:id: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load order' } });
   }
 }

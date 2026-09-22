@@ -1,11 +1,27 @@
+import { z } from 'zod';
+
 import * as billModel from '../models/billModel.js';
 import { pool } from '../db.js';
+import { logger } from '../logger.js';
 
 const VALID_CALL_TRANSITIONS = {
   pending: ['acknowledged', 'resolved'],
   acknowledged: ['resolved'],
   resolved: [],
 };
+
+// Only checks "is this a real status at all" — same split as
+// restaurantOrders.js's orderStatusSchema/itemStatusSchema: which
+// transitions are legal from the CURRENT status needs a DB read first,
+// so that stays a 409 check in the handler below, not something a
+// schema can validate statically. This was the one write endpoint left
+// on the old hand-rolled pattern after the rest of the codebase moved
+// to validate() — found and closed in a 2026-09-22 hardening pass.
+export const updateStatusSchema = z.object({
+  status: z.enum(Object.keys(VALID_CALL_TRANSITIONS), {
+    message: `status must be one of: ${Object.keys(VALID_CALL_TRANSITIONS).join(', ')}`,
+  }),
+});
 
 // ---------------------------------------------------------------------
 // GET /restaurants/:restaurantId/staff-calls?status=pending
@@ -18,7 +34,7 @@ export async function list(req, res) {
     const calls = await billModel.findStaffCalls(restaurantId, statusFilter);
     res.json({ data: calls });
   } catch (err) {
-    console.error('GET /restaurants/:restaurantId/staff-calls: failed:', err.message);
+    logger.error(`GET /restaurants/:restaurantId/staff-calls: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to list staff calls' } });
   }
 }
@@ -35,13 +51,7 @@ export async function list(req, res) {
 // ---------------------------------------------------------------------
 export async function updateStatus(req, res) {
   const { restaurantId, callId } = req.params;
-  const { status: nextStatus } = req.body ?? {};
-
-  if (typeof nextStatus !== 'string' || !(nextStatus in VALID_CALL_TRANSITIONS)) {
-    return res.status(400).json({
-      error: { code: 'INVALID_REQUEST', message: `status must be one of: ${Object.keys(VALID_CALL_TRANSITIONS).join(', ')}` },
-    });
-  }
+  const { status: nextStatus } = req.body;
 
   try {
     const current = await billModel.findStaffCallById(restaurantId, callId);
@@ -72,6 +82,7 @@ export async function updateStatus(req, res) {
             `UPDATE bills SET status = 'settled_traditionally', settled_at = CURRENT_TIMESTAMP WHERE id = $1`,
             [current.bill_id]
           );
+          await billModel.finalizeGuestVisit(bill.sitting_id, bill.id, Number(bill.total_amount) + Number(bill.tip_amount), client);
         }
       }
       await client.query('COMMIT');
@@ -84,7 +95,7 @@ export async function updateStatus(req, res) {
 
     res.json(updated);
   } catch (err) {
-    console.error('PATCH /restaurants/:restaurantId/staff-calls/:callId: failed:', err.message);
+    logger.error(`PATCH /restaurants/:restaurantId/staff-calls/:callId: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update staff call' } });
   }
 }

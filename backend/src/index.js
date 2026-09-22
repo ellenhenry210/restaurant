@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import app from './app.js';
 import { initDb } from './init-db.js';
 import { initRealtime } from './realtime.js';
+import { logger } from './logger.js';
 
 dotenv.config();
 
@@ -23,11 +24,11 @@ async function start() {
   await initDb();
 
   httpServer.listen(PORT, () => {
-    console.log(`✅ Server running on http://localhost:${PORT}`);
+    logger.info(`✅ Server running on http://localhost:${PORT}`);
   });
 }
 
 start().catch((err) => {
-  console.error('❌ Failed to start server:', err.message);
+  logger.error(`❌ Failed to start server: ${err.message}`);
   process.exit(1);
 });

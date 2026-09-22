@@ -1,12 +1,19 @@
 import { Router } from 'express';
+import { z } from 'zod';
 
 import { pool } from '../db.js';
 import { authenticate } from '../middleware/auth.js';
 import { authorize } from '../middleware/authorize.js';
+import { validate } from '../middleware/validate.js';
+import { logger } from '../logger.js';
 
 // mergeParams: true — mounted at /v1/restaurants/:restaurantId/tables,
 // needs :restaurantId from the parent mount (same pattern as staff.js).
 const router = Router({ mergeParams: true });
+
+const assignTableSchema = z.object({
+  staff_id: z.string().min(1, 'staff_id is required'),
+});
 
 // ---------------------------------------------------------------------
 // POST /:tableId/assign — assign a staff member to serve a table. See
@@ -18,13 +25,9 @@ const router = Router({ mergeParams: true });
 // unassign call first — a manager moving tables between servers
 // mid-shift is a single action from their point of view, not two.
 // ---------------------------------------------------------------------
-router.post('/:tableId/assign', authenticate, authorize('assign_table'), async (req, res) => {
+router.post('/:tableId/assign', authenticate, authorize('assign_table'), validate(assignTableSchema), async (req, res) => {
   const { restaurantId, tableId } = req.params;
-  const { staff_id: staffId } = req.body ?? {};
-
-  if (!staffId || typeof staffId !== 'string') {
-    return res.status(400).json({ error: { code: 'INVALID_REQUEST', message: 'staff_id is required' } });
-  }
+  const { staff_id: staffId } = req.body;
 
   const client = await pool.connect();
   try {
@@ -73,7 +76,7 @@ router.post('/:tableId/assign', authenticate, authorize('assign_table'), async (
     });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('POST /tables/:tableId/assign: failed:', err.message);
+    logger.error(`POST /tables/:tableId/assign: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to assign table' } });
   } finally {
     client.release();
@@ -103,7 +106,7 @@ router.post('/:tableId/unassign', authenticate, authorize('assign_table'), async
 
     res.json({ table_id: tableId, was_assigned: result.rows.length > 0 });
   } catch (err) {
-    console.error('POST /tables/:tableId/unassign: failed:', err.message);
+    logger.error(`POST /tables/:tableId/unassign: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to unassign table' } });
   }
 });

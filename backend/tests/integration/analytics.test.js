@@ -58,3 +58,53 @@ describe('GET /v1/restaurants/:id/analytics/daily', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('GET /v1/restaurants/:id/analytics/revenue', () => {
+  it('rejects an invalid period', async () => {
+    const restaurantId = await createRestaurant();
+    const manager = await createStaff(restaurantId, 'manager');
+    const res = await request(app).get(`/v1/restaurants/${restaurantId}/analytics/revenue?period=yearly`).set('Authorization', `Bearer ${manager.token}`);
+    expect(res.status).toBe(400);
+  });
+
+  it('buckets revenue by day and excludes cancelled orders', async () => {
+    const restaurantId = await createRestaurant();
+    const table = await createTable(restaurantId, 1);
+    const manager = await createStaff(restaurantId, 'manager');
+    await createOrder(restaurantId, table.id, { totalAmount: 1000 });
+    await createOrder(restaurantId, table.id, { totalAmount: 2000 });
+    await createOrder(restaurantId, table.id, { status: 'cancelled', totalAmount: 9999 });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const res = await request(app)
+      .get(`/v1/restaurants/${restaurantId}/analytics/revenue?period=daily&from=${today}&to=${today}`)
+      .set('Authorization', `Bearer ${manager.token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.breakdown).toHaveLength(1);
+    expect(res.body.breakdown[0]).toMatchObject({ orders: 2, revenue: 3000 });
+  });
+});
+
+describe('GET /v1/platform/analytics', () => {
+  it('rejects a non-platform-admin', async () => {
+    const restaurantId = await createRestaurant();
+    const owner = await createStaff(restaurantId, 'owner');
+    const res = await request(app).get('/v1/platform/analytics').set('Authorization', `Bearer ${owner.token}`);
+    expect(res.status).toBe(403);
+  });
+
+  it('returns platform-wide totals for a platform admin', async () => {
+    const restaurantId = await createRestaurant();
+    const table = await createTable(restaurantId, 1);
+    const owner = await createStaff(restaurantId, 'owner');
+    await createOrder(restaurantId, table.id, { totalAmount: 1500 });
+    await pool.query('INSERT INTO platform_admins (user_id) VALUES ($1)', [owner.userId]);
+
+    const res = await request(app).get('/v1/platform/analytics').set('Authorization', `Bearer ${owner.token}`);
+    expect(res.status).toBe(200);
+    expect(res.body.total_restaurants).toBeGreaterThanOrEqual(1);
+    expect(res.body.total_orders).toBeGreaterThanOrEqual(1);
+    expect(res.body.total_revenue).toBeGreaterThanOrEqual(1500);
+  });
+});

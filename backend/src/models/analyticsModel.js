@@ -1,5 +1,61 @@
 import { pool } from '../db.js';
 
+const PERIOD_TO_TRUNC_UNIT = { daily: 'day', weekly: 'week', monthly: 'month' };
+
+/**
+ * Per-period revenue breakdown — the "/analytics/revenue" endpoint
+ * flagged as still-missing alongside the original daily-metrics work.
+ * Distinct from findDailyMetrics: that one collapses a whole window into
+ * a single summary; this one buckets it (one row per day/week/month).
+ * @returns {Promise<{period_start, orders, revenue}[]>}
+ */
+export async function findRevenueByPeriod(restaurantId, period, from, to, executor = pool) {
+  const truncUnit = PERIOD_TO_TRUNC_UNIT[period];
+  const result = await executor.query(
+    `SELECT date_trunc($4, placed_at) AS period_start,
+            COUNT(*) AS orders,
+            COALESCE(SUM(total_amount), 0) AS revenue
+     FROM orders
+     WHERE restaurant_id = $1
+       AND placed_at >= $2::date
+       AND placed_at < ($3::date + INTERVAL '1 day')
+       AND status != 'cancelled'
+     GROUP BY period_start
+     ORDER BY period_start ASC`,
+    [restaurantId, from, to, truncUnit]
+  );
+  return result.rows.map((r) => ({
+    period_start: r.period_start,
+    orders: Number(r.orders),
+    revenue: Number(r.revenue),
+  }));
+}
+
+/**
+ * Cross-restaurant totals — view_platform_analytics, System Admin only.
+ * All-time, not date-ranged: a platform-level "how big is SnapOrder
+ * right now" snapshot, not a report — a date-ranged version can be
+ * added if/when that's actually asked for, not speculatively now.
+ */
+export async function findPlatformTotals(executor = pool) {
+  const result = await executor.query(
+    `SELECT
+       (SELECT COUNT(*) FROM restaurants) AS total_restaurants,
+       (SELECT COUNT(*) FROM restaurants WHERE is_active) AS active_restaurants,
+       (SELECT COUNT(*) FROM orders WHERE status != 'cancelled') AS total_orders,
+       (SELECT COALESCE(SUM(total_amount), 0) FROM orders WHERE status != 'cancelled') AS total_revenue,
+       (SELECT COUNT(DISTINCT id) FROM guest_profiles) AS total_guest_profiles`
+  );
+  const r = result.rows[0];
+  return {
+    total_restaurants: Number(r.total_restaurants),
+    active_restaurants: Number(r.active_restaurants),
+    total_orders: Number(r.total_orders),
+    total_revenue: Number(r.total_revenue),
+    total_guest_profiles: Number(r.total_guest_profiles),
+  };
+}
+
 /**
  * Daily/period restaurant metrics, matching the shape already sketched in
  * SNAPORDER_API_CONTRACTS.md's Analytics Dashboard section. `days` widens

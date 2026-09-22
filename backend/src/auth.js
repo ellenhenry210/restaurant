@@ -1,8 +1,20 @@
 import jwt from 'jsonwebtoken';
+import crypto from 'node:crypto';
 
 // How long a token stays valid after it's issued. Falls back to 6h if the
 // env var isn't set, matching .env.example.
 const JWT_EXPIRY = process.env.JWT_EXPIRY || '6h';
+
+// How long a refresh token stays valid — deliberately much longer than
+// an access token (that's the whole point of the pair), but still
+// bounded rather than forever, so a token that's never explicitly
+// revoked doesn't stay usable indefinitely either.
+const REFRESH_TOKEN_EXPIRY_DAYS = Number(process.env.REFRESH_TOKEN_EXPIRY_DAYS) || 30;
+
+// How long an MFA challenge (the interstitial step between "password
+// checked out" and "TOTP code verified") stays valid — short, since
+// it's meant to be used within the same login attempt, not saved for later.
+const MFA_CHALLENGE_EXPIRY = '5m';
 
 // Guest sessions get their own, shorter expiry — a typical dining visit,
 // not a work shift. Separate from JWT_EXPIRY (staff) so tuning one never
@@ -114,4 +126,48 @@ export function verifyToken(token) {
   // expired token — callers should catch this and respond 401, not treat
   // a caught error as "valid".
   return jwt.verify(token, getSecret());
+}
+
+/**
+ * A new opaque refresh token — a random value, not a JWT. Deliberately
+ * not self-describing (no embedded expiry/claims a client could decode)
+ * since the whole point is that its validity is decided server-side, by
+ * looking up its hash in `refresh_tokens` (routes/auth.js), the same way
+ * a session cookie would be — that's what makes early revocation
+ * (logout, a detected compromise) actually take effect.
+ * @returns {{ raw: string, hash: string, expiresAt: Date }}
+ */
+export function generateRefreshToken() {
+  const raw = crypto.randomBytes(40).toString('hex');
+  const hash = hashOpaqueToken(raw);
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+  return { raw, hash, expiresAt };
+}
+
+/**
+ * SHA-256 hex digest — used for both refresh tokens and password-reset
+ * tokens (routes/auth.js). Not bcrypt: these are already high-entropy
+ * random values (unlike a human-chosen password), so there's no
+ * brute-forcing risk a slow hash defends against; a fast, deterministic
+ * hash is what lets a lookup query find the row by hash directly instead
+ * of re-hashing and comparing every stored row.
+ * @param {string} raw
+ * @returns {string}
+ */
+export function hashOpaqueToken(raw) {
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+/**
+ * A short-lived, single-purpose token proving "this user's password
+ * just checked out, but they still need to provide a TOTP code" — the
+ * interstitial step in routes/auth.js's login flow when mfa_enabled is
+ * true. Deliberately its own token `type` (mirroring generateGuestToken's
+ * reasoning) so it can never be mistaken for, or accepted in place of, a
+ * real access token by any authenticate()-guarded route.
+ * @param {string} userId
+ * @returns {string}
+ */
+export function generateMfaChallengeToken(userId) {
+  return jwt.sign({ sub: userId, type: 'mfa_challenge' }, getSecret(), { expiresIn: MFA_CHALLENGE_EXPIRY });
 }

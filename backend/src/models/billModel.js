@@ -93,6 +93,47 @@ export async function updateBillStatus(billId, status, executor = pool) {
   await executor.query(`UPDATE bills SET status = $1 WHERE id = $2`, [status, billId]);
 }
 
+// --- Guest history (guest_visits) ---
+//
+// Closes a previously-flagged "kept for later" gap: the table existed
+// (migration 013) but nothing populated it. Wired at the two natural
+// points that already exist — a visit starts the moment a guest's first
+// order in a sitting is placed (orderController.create), and finishes
+// (total_spent filled in) the moment that sitting's bill actually
+// settles (billModel.resolveBillTransaction / staffCallController's
+// pay_traditional resolve path) — no new "close sitting" mechanism
+// needed for this specific piece.
+
+/** Idempotent — ON CONFLICT on the table's own UNIQUE(sitting_id) means a second order in the same sitting is a no-op, not a duplicate visit. */
+export async function upsertGuestVisit(sittingId, restaurantId, guestProfileId, executor = pool) {
+  await executor.query(
+    `INSERT INTO guest_visits (restaurant_id, sitting_id, guest_profile_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (sitting_id) DO NOTHING`,
+    [restaurantId, sittingId, guestProfileId]
+  );
+}
+
+export async function finalizeGuestVisit(sittingId, billId, totalSpent, executor = pool) {
+  await executor.query(`UPDATE guest_visits SET bill_id = $1, total_spent = $2 WHERE sitting_id = $3`, [billId, totalSpent, sittingId]);
+}
+
+/**
+ * @param {string} excludeSittingId — the caller's own current sitting,
+ *   excluded so a guest who just placed their first-ever order isn't
+ *   counted as "returning" from a visit that's still in progress.
+ * @returns {Promise<number>} how many PAST visits this guest has at this
+ *   restaurant — "repeat guest" recognition (per-restaurant, see
+ *   SNAPORDER_STATUS.md's cross-restaurant-identity caveat).
+ */
+export async function countVisits(guestProfileId, excludeSittingId, executor = pool) {
+  const result = await executor.query(
+    `SELECT COUNT(*)::int AS n FROM guest_visits WHERE guest_profile_id = $1 AND sitting_id != $2`,
+    [guestProfileId, excludeSittingId]
+  );
+  return result.rows[0].n;
+}
+
 /** Any phone number attached to an order in this sitting — every order requires one at creation, so this is available as soon as at least one order exists. Used for the Paystack synthesized-email workaround, same as paymentModel.findOrderForPayment. */
 export async function findAnyGuestPhoneForSitting(sittingId, executor = pool) {
   const result = await executor.query(
@@ -137,7 +178,7 @@ export async function insertShares(splitId, shares, executor = pool) {
 }
 
 export async function findSharesBySplit(splitId, executor = pool) {
-  const result = await executor.query(`SELECT * FROM bill_split_shares WHERE split_id = $1 ORDER BY created_at ASC`, [splitId]);
+  const result = await executor.query(`SELECT * FROM bill_split_shares WHERE split_id = $1 ORDER BY guest_label ASC`, [splitId]);
   return result.rows;
 }
 
@@ -237,9 +278,57 @@ export async function resolveBillTransaction({ transactionId, billId, reference,
       [share.split_id]
     );
     if (remaining.rows[0].n === 0) {
-      await executor.query(`UPDATE bills SET status = 'paid', settled_at = CURRENT_TIMESTAMP WHERE id = $1`, [billId]);
+      await settleBillAndFinalizeVisit(billId, executor);
     }
   } else {
-    await executor.query(`UPDATE bills SET status = 'paid', settled_at = CURRENT_TIMESTAMP WHERE id = $1`, [billId]);
+    await settleBillAndFinalizeVisit(billId, executor);
   }
+}
+
+/** Marks a bill paid and, in the same step, finalizes the guest_visits row for its sitting (bill_id + total_spent) — see the "Guest history" section above. */
+async function settleBillAndFinalizeVisit(billId, executor) {
+  const result = await executor.query(
+    `UPDATE bills SET status = 'paid', settled_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING sitting_id, total_amount, tip_amount`,
+    [billId]
+  );
+  const bill = result.rows[0];
+  // total_spent is the actual amount the guest paid — total_amount alone
+  // excludes the tip, the same "grand_total" distinction orders/bills
+  // already make everywhere else.
+  await finalizeGuestVisit(bill.sitting_id, billId, Number(bill.total_amount) + Number(bill.tip_amount), executor);
+}
+
+// --- Refunds (issue_refund) & payment history (view_payment_history) ---
+
+/** @returns {Promise<object|null>} the successful payment_transactions row for a bill — the only kind Paystack can actually refund. */
+export async function findSuccessfulTransactionForBill(billId, executor = pool) {
+  const result = await executor.query(
+    `SELECT id, reference, amount, currency FROM payment_transactions WHERE bill_id = $1 AND status = 'success' ORDER BY paid_at DESC LIMIT 1`,
+    [billId]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function markTransactionRefunded(transactionId, executor = pool) {
+  await executor.query(`UPDATE payment_transactions SET status = 'refunded', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [transactionId]);
+}
+
+export async function markBillRefunded(billId, executor = pool) {
+  const result = await executor.query(
+    `UPDATE bills SET status = 'refunded', refunded_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id, status, refunded_at`,
+    [billId]
+  );
+  return result.rows[0];
+}
+
+/** Every payment_transactions row for a restaurant — view_payment_history's read surface, newest first. */
+export async function findTransactionsForRestaurant(restaurantId, executor = pool) {
+  const result = await executor.query(
+    `SELECT id, order_id, bill_id, reference, amount, currency, status, gateway, paid_at, created_at
+     FROM payment_transactions
+     WHERE restaurant_id = $1
+     ORDER BY created_at DESC`,
+    [restaurantId]
+  );
+  return result.rows;
 }

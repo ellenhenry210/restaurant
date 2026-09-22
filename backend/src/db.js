@@ -1,5 +1,6 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
+import { logger } from './logger.js';
 
 // Unlike auth.js, this module calls dotenv.config() itself, right here, at
 // the top — before reading any process.env values below. That sidesteps
@@ -56,7 +57,7 @@ export const pool = new Pool({
 // transient DB blip shouldn't take the whole server down along with it —
 // the next query attempt will simply try to acquire a fresh client.
 pool.on('error', (err) => {
-  console.error('Unexpected error on idle PostgreSQL client:', err.message);
+  logger.error(`Unexpected error on idle PostgreSQL client: ${err.message}`);
 });
 
 /**
@@ -76,11 +77,11 @@ export async function query(text, params) {
     if (durationMs > 200) {
       // Cheap slow-query signal without pulling in a full logging library
       // yet (see known-gaps: structured logging is still unimplemented).
-      console.warn(`Slow query (${durationMs}ms): ${text}`);
+      logger.warn(`Slow query (${durationMs}ms): ${text}`);
     }
     return result;
   } catch (err) {
-    console.error('Query failed:', { text, params, error: err.message });
+    logger.error('Query failed:', { text, params, error: err.message });
     throw err; // Let the caller decide how to respond (e.g. a 500) — this
                // helper adds logging, it doesn't swallow the failure.
   }
@@ -99,10 +100,10 @@ export async function testConnection() {
   try {
     client = await pool.connect(); // checks a client out of the pool
     const result = await client.query('SELECT NOW() AS current_time, version() AS pg_version');
-    console.log('✅ Database connection OK:', result.rows[0].current_time);
+    logger.info(`✅ Database connection OK: ${result.rows[0].current_time}`);
     return true;
   } catch (err) {
-    console.error('❌ Database connection failed:', err.message);
+    logger.error(`❌ Database connection failed: ${err.message}`);
     return false;
   } finally {
     // Always release the client back to the pool, whether the query

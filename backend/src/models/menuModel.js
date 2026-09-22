@@ -54,20 +54,27 @@ export async function findMenuById(menuId, restaurantId, executor = pool) {
  * @param {string} menuId
  * @returns {Promise<{id, name, meals: object[]}[]>}
  */
-export async function findCategoriesWithMealsByMenu(menuId, executor = pool) {
+/**
+ * @param {boolean} includeUnavailable — false (default) for the guest-
+ *   facing menu, where an unavailable meal shouldn't appear at all.
+ *   Staff-facing views (the admin menu editor) need the opposite — a
+ *   meal marked out of stock has to stay visible, or there'd be no way
+ *   to see it again to re-enable it.
+ */
+export async function findCategoriesWithMealsByMenu(menuId, includeUnavailable = false, executor = pool) {
   const result = await executor.query(
     `SELECT
        mc.id AS category_id, mc.name AS category_name, mc.sort_order AS category_sort_order,
        meals.id AS meal_id, meals.name AS meal_name, meals.description AS meal_description,
-       meals.image_url, meals.base_price, meals.currency,
+       meals.image_url, meals.base_price, meals.currency, meals.is_available,
        meals.calories, meals.protein_grams,
        meals.is_vegan, meals.is_vegetarian, meals.is_gluten_free, meals.is_low_calorie, meals.is_high_protein,
        meals.estimated_prep_time_minutes, meals.sort_order AS meal_sort_order
      FROM meal_categories mc
-     LEFT JOIN meals ON meals.category_id = mc.id AND meals.is_available = TRUE
+     LEFT JOIN meals ON meals.category_id = mc.id AND ($2::boolean OR meals.is_available = TRUE)
      WHERE mc.menu_id = $1 AND mc.is_active = TRUE
      ORDER BY mc.sort_order ASC, meals.sort_order ASC`,
-    [menuId]
+    [menuId, includeUnavailable]
   );
 
   const categoriesById = new Map();
@@ -90,6 +97,7 @@ export async function findCategoriesWithMealsByMenu(menuId, executor = pool) {
         is_gluten_free: row.is_gluten_free,
         is_low_calorie: row.is_low_calorie,
         is_high_protein: row.is_high_protein,
+        is_available: row.is_available,
         estimated_prep_time_minutes: row.estimated_prep_time_minutes,
       });
     }
@@ -147,6 +155,47 @@ export async function findIngredientsByMealId(mealId) {
  * category that belongs to a DIFFERENT restaurant.
  * @returns {Promise<{id}|null>}
  */
+// Whitelisted tag->column mapping — the only thing ever interpolated
+// into the query below is a value looked up from this object, never the
+// raw query string itself, so this can't become a SQL-injection point
+// no matter what a caller sends as ?tags=.
+const TAG_COLUMNS = {
+  vegan: 'is_vegan',
+  vegetarian: 'is_vegetarian',
+  gluten_free: 'is_gluten_free',
+  low_calorie: 'is_low_calorie',
+  high_protein: 'is_high_protein',
+};
+
+/**
+ * Basic rule-based recommendations (SNAPORDER_STATUS.md's Phase 2 spec:
+ * "health goal + allergy -> safe meal", the guest-facing half only —
+ * the restaurant-facing "chef suggestion engine" needs demand/margin
+ * data this project doesn't have yet, and is correctly Phase 3, not
+ * attempted here). Filters on the meal's own existing dietary tags
+ * (already in the schema — no separate nutritional-data layer needed
+ * for this basic version) and ranks by how often each meal has actually
+ * been ordered — a real popularity signal, not a guess.
+ * @param {string[]} tags — any of TAG_COLUMNS' keys; unrecognized values are ignored, not rejected.
+ */
+export async function findRecommendedMeals(restaurantId, tags, limit, executor = pool) {
+  const validColumns = tags.map((t) => TAG_COLUMNS[t]).filter(Boolean);
+  const tagFilter = validColumns.length > 0 ? `AND ${validColumns.map((c) => `m.${c}`).join(' AND ')}` : '';
+
+  const result = await executor.query(
+    `SELECT m.id, m.name, m.description, m.base_price, m.currency,
+            m.is_vegan, m.is_vegetarian, m.is_gluten_free, m.is_low_calorie, m.is_high_protein,
+            COALESCE(oc.times_ordered, 0) AS times_ordered
+     FROM meals m
+     LEFT JOIN (SELECT meal_id, SUM(quantity) AS times_ordered FROM order_items GROUP BY meal_id) oc ON oc.meal_id = m.id
+     WHERE m.restaurant_id = $1 AND m.is_available = TRUE ${tagFilter}
+     ORDER BY times_ordered DESC, m.name ASC
+     LIMIT $2`,
+    [restaurantId, limit]
+  );
+  return result.rows.map((r) => ({ ...r, times_ordered: Number(r.times_ordered) }));
+}
+
 export async function findCategoryForRestaurant(categoryId, restaurantId, executor = pool) {
   const result = await executor.query(
     `SELECT mc.id

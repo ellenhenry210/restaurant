@@ -75,3 +75,28 @@ export function verifyWebhookSignature(rawBody, signatureHeader) {
   const b = Buffer.from(signatureHeader, 'utf8');
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+
+/**
+ * Refund a previously-successful transaction — issue_refund
+ * (manager/owner/system_admin), the write half of the permission that's
+ * existed in the matrix since day one with nothing behind it.
+ * @param {{ reference: string, amountKobo?: number }} params —
+ *   amountKobo omitted refunds the transaction in full; Paystack itself
+ *   defaults to a full refund when `amount` isn't sent.
+ */
+export async function refundTransaction({ reference, amountKobo }) {
+  const response = await fetch(`${PAYSTACK_BASE_URL}/refund`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${getSecretKey()}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ transaction: reference, amount: amountKobo }),
+  });
+
+  const data = await response.json();
+  if (!response.ok || data.status !== true) {
+    throw new Error(data.message || `Paystack refund failed (HTTP ${response.status})`);
+  }
+  return data.data;
+}

@@ -1,6 +1,7 @@
 import { pool } from '../db.js';
 import { roleGrants } from '../authorization/permissions.js';
 import { logAudit } from '../audit.js';
+import { logger } from '../logger.js';
 
 /**
  * The System Admin counterpart to middleware/authorize.js — same idea
@@ -31,7 +32,7 @@ export function requirePlatformAdmin(permissionKey) {
 
   return async (req, res, next) => {
     if (!req.user) {
-      console.error(`requirePlatformAdmin('${permissionKey}'): req.user missing — authenticate() must run first.`);
+      logger.error(`requirePlatformAdmin('${permissionKey}'): req.user missing — authenticate() must run first.`);
       return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Server misconfiguration' } });
     }
 
@@ -40,7 +41,7 @@ export function requirePlatformAdmin(permissionKey) {
       const result = await pool.query('SELECT id FROM platform_admins WHERE user_id = $1', [req.user.id]);
       isPlatformAdmin = result.rows.length > 0;
     } catch (err) {
-      console.error('requirePlatformAdmin: lookup failed:', err.message);
+      logger.error(`requirePlatformAdmin: lookup failed: ${err.message}`);
       return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to authorize request' } });
     }
 

@@ -1,5 +1,7 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import cors from 'cors';
+import helmet from 'helmet';
 
 import { generalLimiter, authLimiter } from './middleware/rateLimit.js';
 import { authenticate } from './middleware/auth.js';
@@ -15,6 +17,16 @@ import paymentRoutes from './routes/payments.js';
 import qrRoutes from './routes/qr.js';
 import billRoutes from './routes/bills.js';
 import staffCallRoutes from './routes/staffCalls.js';
+import guestVerificationRoutes from './routes/guestVerification.js';
+import reviewRoutes from './routes/reviews.js';
+import restaurantReviewRoutes from './routes/restaurantReviews.js';
+import suggestionRoutes from './routes/suggestions.js';
+import restaurantSuggestionRoutes from './routes/restaurantSuggestions.js';
+import ingredientRoutes from './routes/ingredients.js';
+import restaurantBillRoutes from './routes/restaurantBills.js';
+import restaurantPaymentRoutes from './routes/restaurantPayments.js';
+import platformRoutes from './routes/platform.js';
+import { logger } from './logger.js';
 
 // Split out of index.js (2026-09-17) so the Express app can be imported
 // on its own — by supertest in integration tests, or by anything else
@@ -24,6 +36,32 @@ import staffCallRoutes from './routes/staffCalls.js';
 dotenv.config();
 
 export const app = express();
+
+// Sets various security headers (HSTS, X-Content-Type-Options, disables
+// X-Powered-By, etc.) — sensible defaults for a pure JSON API, no custom
+// CSP needed since this app never serves HTML itself.
+app.use(helmet());
+
+// CORS_ORIGIN is a comma-separated allowlist, not a wildcard — this API
+// is called with Bearer tokens (guest/staff), never cookies, so a
+// wildcard wouldn't even be a credentials risk, but an explicit
+// allowlist is still the right default over trusting any origin blindly.
+// Falls back to Vite's default dev port so local frontend dev keeps
+// working without extra setup.
+const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173').split(',').map((o) => o.trim());
+app.use(
+  cors({
+    origin(origin, callback) {
+      // No Origin header at all (server-to-server calls, curl, Paystack's
+      // webhook) — CORS is a browser-enforced mechanism, so this isn't a
+      // security gate on its own; the webhook has its own HMAC check.
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      callback(new Error(`Origin '${origin}' is not allowed by CORS`));
+    },
+  })
+);
 
 // Applied before express.json() so an over-limit request is rejected
 // cheaply, without paying the cost of parsing its body first.
@@ -106,6 +144,35 @@ app.use('/v1', billRoutes);
 // authenticate + authorize('process_payment'). See routes/staffCalls.js.
 app.use('/v1/restaurants/:restaurantId/staff-calls', staffCallRoutes);
 
+// Guest phone verification (OTP) — behind authenticateGuest. Mechanism
+// only, not yet required by any other flow — see migration 020.
+app.use('/v1', guestVerificationRoutes);
+
+// Feedback & Suggestions system — guest-facing writes + the public
+// review listing. See routes/reviews.js.
+app.use('/v1', reviewRoutes);
+
+// Staff-side of reviews (reply/moderate) — behind authenticate +
+// authorize(). See routes/restaurantReviews.js.
+app.use('/v1/restaurants/:restaurantId/reviews', restaurantReviewRoutes);
+
+// Feedback & Suggestions — the public roadmap. Platform-wide, not
+// restaurant-scoped (feature_suggestions has no restaurant_id). See
+// routes/suggestions.js.
+app.use('/v1', suggestionRoutes);
+app.use('/v1/restaurants/:restaurantId/suggestions', restaurantSuggestionRoutes);
+
+// Inventory — meal availability (mark_out_of_stock, in routes/menus.js)
+// + ingredient stock levels (set_inventory_levels/view_inventory).
+app.use('/v1/restaurants/:restaurantId/ingredients', ingredientRoutes);
+
+// Refunds (issue_refund) + payment history (view_payment_history).
+app.use('/v1/restaurants/:restaurantId/bills', restaurantBillRoutes);
+app.use('/v1/restaurants/:restaurantId/payments', restaurantPaymentRoutes);
+
+// Platform-level resources — System Admin only. See routes/platform.js.
+app.use('/v1/platform', platformRoutes);
+
 // 404 for anything that didn't match a route above — must come after
 // every real route. Without this, an unmatched path (a typo, a
 // deprecated endpoint) falls through to Express's default HTML 404
@@ -142,7 +209,7 @@ app.use((err, req, res, next) => {
     return res.status(413).json({ error: { code: 'INVALID_REQUEST', message: 'Request body too large' } });
   }
 
-  console.error('Unhandled error:', err);
+  logger.error('Unhandled error:', err);
   res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Something went wrong' } });
 });
 

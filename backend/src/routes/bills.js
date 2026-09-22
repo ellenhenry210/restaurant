@@ -1,6 +1,7 @@
 import { Router } from 'express';
 
 import { authenticateGuest } from '../middleware/authGuest.js';
+import { validate } from '../middleware/validate.js';
 import * as billController from '../controllers/billController.js';
 
 // All guest-facing — see SNAPORDER_API_CONTRACTS.md's "Bills & Payment
@@ -9,10 +10,10 @@ import * as billController from '../controllers/billController.js';
 // /guest/session/bill... and /bills/....
 const router = Router();
 
-router.post('/guest/session/bill', authenticateGuest, billController.create);
+router.post('/guest/session/bill', authenticateGuest, validate(billController.createBillSchema), billController.create);
 router.get('/guest/session/bill/:billId', authenticateGuest, billController.getOne);
 
-router.post('/bills/:billId/request-split', authenticateGuest, billController.requestSplit);
+router.post('/bills/:billId/request-split', authenticateGuest, validate(billController.requestSplitSchema), billController.requestSplit);
 router.get('/bills/:billId/splits', authenticateGuest, billController.getSplits);
 router.post('/bills/:billId/payments/initialize', authenticateGuest, billController.initializeBillPayment);
 router.post('/bills/splits/:shareId/payments/initialize', authenticateGuest, billController.initializeSharePayment);

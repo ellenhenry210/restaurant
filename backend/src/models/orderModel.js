@@ -142,6 +142,25 @@ export async function insertOrderItem(item, executor = pool) {
  *   the guest-facing order-status page needs to know whether to show a
  *   "Pay with Paystack" button.
  */
+/**
+ * Past orders for a guest at this restaurant — "your order history"
+ * (SNAPORDER_STATUS.md's "Guest order history" gap). Scoped by
+ * guest_profile_id, which is itself per-restaurant (see product-vision's
+ * cross-restaurant-identity caveat) — this is "your history here", not
+ * a cross-restaurant timeline.
+ * @returns {Promise<object[]>}
+ */
+export async function findOrderHistoryForGuestProfile(guestProfileId, executor = pool) {
+  const result = await executor.query(
+    `SELECT id, order_number, status, placed_at, subtotal, tax, service_charge, total_amount, tip_amount, currency
+     FROM orders
+     WHERE guest_profile_id = $1
+     ORDER BY placed_at DESC`,
+    [guestProfileId]
+  );
+  return result.rows;
+}
+
 export async function findById(orderId, executor = pool) {
   const result = await executor.query(
     `SELECT id, restaurant_id, table_id, order_number, status,
@@ -153,6 +172,17 @@ export async function findById(orderId, executor = pool) {
     [orderId]
   );
   return result.rows[0] ?? null;
+}
+
+/** @returns {Promise<{id, status, cancelled_at}>} */
+export async function cancelOrder(orderId, executor = pool) {
+  const result = await executor.query(
+    `UPDATE orders SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1
+     RETURNING id, status, cancelled_at`,
+    [orderId]
+  );
+  return result.rows[0];
 }
 
 /** @returns {Promise<object[]>} */

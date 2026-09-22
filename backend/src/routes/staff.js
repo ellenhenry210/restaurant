@@ -1,10 +1,13 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
+import { z } from 'zod';
 
 import { pool } from '../db.js';
 import { authenticate } from '../middleware/auth.js';
 import { authorize } from '../middleware/authorize.js';
+import { validate } from '../middleware/validate.js';
 import { STAFF_ROLES } from '../authorization/permissions.js';
+import { logger } from '../logger.js';
 
 // mergeParams: true — this router is mounted at
 // /v1/restaurants/:restaurantId/staff (see index.js), and needs that
@@ -12,9 +15,25 @@ import { STAFF_ROLES } from '../authorization/permissions.js';
 // route params down to a mounted router by default.
 const router = Router({ mergeParams: true });
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
 const BCRYPT_SALT_ROUNDS = 12;
+
+// password's requiredness depends on whether the email already has an
+// account — a DB lookup the schema can't see — so that half of the rule
+// stays in the handler below, same as before. This only covers what a
+// schema genuinely can validate statically.
+const addStaffSchema = z.object({
+  email: z.string().min(1, 'required').email('must be a valid email address'),
+  name: z.string().min(1, 'required'),
+  display_name: z.string().optional(),
+  role: z.enum(STAFF_ROLES, { message: `must be one of: ${STAFF_ROLES.join(', ')}` }),
+  password: z.string().optional(),
+  phone: z.string().optional(),
+});
+
+const updateStaffSchema = z.object({
+  display_name: z.string().nullable(),
+});
 
 // GET /v1/restaurants/:restaurantId/staff — first real demonstration of
 // authorize() end-to-end: 'view_staff' is Manager/Owner/System Admin
@@ -33,7 +52,7 @@ router.get('/', authenticate, authorize('view_staff'), async (req, res) => {
     );
     res.json({ data: result.rows });
   } catch (err) {
-    console.error('GET /staff: failed:', err.message);
+    logger.error(`GET /staff: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to list staff' } });
   }
 });
@@ -51,22 +70,8 @@ router.get('/', authenticate, authorize('view_staff'), async (req, res) => {
 // same person can be added as staff at a second restaurant using the
 // login they already have, without a separate password to manage.
 // ---------------------------------------------------------------------
-router.post('/', authenticate, authorize('manage_staff'), async (req, res) => {
-  const { email, name, display_name: displayName, role, password, phone } = req.body ?? {};
-
-  const errors = [];
-  if (!email || typeof email !== 'string' || !EMAIL_RE.test(email)) {
-    errors.push({ field: 'email', reason: 'must be a valid email address' });
-  }
-  if (!name || typeof name !== 'string') {
-    errors.push({ field: 'name', reason: 'required' });
-  }
-  if (!STAFF_ROLES.includes(role)) {
-    errors.push({ field: 'role', reason: `must be one of: ${STAFF_ROLES.join(', ')}` });
-  }
-  if (errors.length > 0) {
-    return res.status(400).json({ error: { code: 'INVALID_REQUEST', message: 'One or more fields are invalid', details: errors } });
-  }
+router.post('/', authenticate, authorize('manage_staff'), validate(addStaffSchema), async (req, res) => {
+  const { email, name, display_name: displayName, role, password, phone } = req.body;
 
   const client = await pool.connect();
   try {
@@ -112,7 +117,7 @@ router.post('/', authenticate, authorize('manage_staff'), async (req, res) => {
     if (err.code === '23505') {
       return res.status(409).json({ error: { code: 'CONFLICT', message: 'This person is already staff at this restaurant' } });
     }
-    console.error('POST /staff: failed:', err.message);
+    logger.error(`POST /staff: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to add staff' } });
   } finally {
     client.release();
@@ -127,14 +132,8 @@ router.post('/', authenticate, authorize('manage_staff'), async (req, res) => {
 // own identity check: req.user.id maps to which restaurant_staff row),
 // so for now only an Owner/System Admin can change it.
 // ---------------------------------------------------------------------
-router.patch('/:staffId', authenticate, authorize('manage_staff'), async (req, res) => {
-  const { display_name: displayName } = req.body ?? {};
-
-  if (displayName !== null && typeof displayName !== 'string') {
-    return res.status(400).json({
-      error: { code: 'INVALID_REQUEST', message: 'display_name must be a string, or null to clear it' },
-    });
-  }
+router.patch('/:staffId', authenticate, authorize('manage_staff'), validate(updateStaffSchema), async (req, res) => {
+  const { display_name: displayName } = req.body;
 
   try {
     const result = await pool.query(
@@ -151,7 +150,7 @@ router.patch('/:staffId', authenticate, authorize('manage_staff'), async (req, r
 
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('PATCH /staff/:staffId: failed:', err.message);
+    logger.error(`PATCH /staff/:staffId: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update staff member' } });
   }
 });

@@ -1,4 +1,5 @@
 import { runMigrations } from '../database/migrate.js';
+import { logger } from './logger.js';
 
 /**
  * Ensures the database schema is up to date, by applying any migrations
@@ -46,6 +47,6 @@ import { runMigrations } from '../database/migrate.js';
  *     runs once before any app instance starts) instead of here.
  */
 export async function initDb() {
-  console.log('🔧 Checking database schema...');
+  logger.info('🔧 Checking database schema...');
   await runMigrations();
 }

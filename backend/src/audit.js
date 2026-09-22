@@ -1,4 +1,5 @@
 import { pool } from './db.js';
+import { logger } from './logger.js';
 
 /**
  * Writes one row to audit_log (SNAPORDER_DATABASE_SCHEMA.md table 17;
@@ -34,6 +35,6 @@ export async function logAudit({
       [restaurantId, action, actorType, actorId, resourceType, resourceId, changes ? JSON.stringify(changes) : null, ipAddress]
     );
   } catch (err) {
-    console.error('logAudit: failed to write audit_log row:', err.message);
+    logger.error(`logAudit: failed to write audit_log row: ${err.message}`);
   }
 }

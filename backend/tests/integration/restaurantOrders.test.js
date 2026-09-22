@@ -3,7 +3,7 @@ import { jest } from '@jest/globals';
 
 import app from '../../src/app.js';
 import { resetDb, closeDb } from '../helpers/db.js';
-import { createRestaurant, createStaff, createTable, createOrder } from '../helpers/fixtures.js';
+import { createRestaurant, createStaff, createTable, createOrder, createMenuWithMeal, createGuestSession } from '../helpers/fixtures.js';
 
 // See orders.test.js — same expected, harmless realtime-broadcast noise
 // when running the app with no Socket.io server behind it.
@@ -85,5 +85,46 @@ describe('GET /v1/restaurants/:restaurantId/orders', () => {
     const res = await request(app).get(`/v1/restaurants/${restaurantId}/orders`).set('Authorization', `Bearer ${otherStaff.token}`);
 
     expect(res.status).toBe(403);
+  });
+
+  it('includes table_number, not just table_id', async () => {
+    const restaurantId = await createRestaurant();
+    const table = await createTable(restaurantId, 7);
+    await createOrder(restaurantId, table.id);
+    const manager = await createStaff(restaurantId, 'manager');
+
+    const res = await request(app).get(`/v1/restaurants/${restaurantId}/orders`).set('Authorization', `Bearer ${manager.token}`);
+    expect(res.body.data[0].table_number).toBe(7);
+  });
+});
+
+describe('GET /v1/restaurants/:restaurantId/orders/:orderId', () => {
+  it('returns full order detail with items', async () => {
+    const restaurantId = await createRestaurant();
+    const table = await createTable(restaurantId, 1);
+    const { mealId } = await createMenuWithMeal(restaurantId);
+    const guest = await createGuestSession(restaurantId, table.id, { phoneNumber: '+2348012345678' });
+    const created = await request(app)
+      .post('/v1/orders')
+      .set('Authorization', `Bearer ${guest.token}`)
+      .send({ phone_number: '+2348012345678', items: [{ meal_id: mealId, quantity: 2 }] });
+    const manager = await createStaff(restaurantId, 'manager');
+
+    const res = await request(app).get(`/v1/restaurants/${restaurantId}/orders/${created.body.id}`).set('Authorization', `Bearer ${manager.token}`);
+    expect(res.status).toBe(200);
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.items[0]).toMatchObject({ quantity: 2 });
+    expect(res.body.table_number).toBe(1);
+  });
+
+  it('404s for an order at a different restaurant', async () => {
+    const restaurantId = await createRestaurant();
+    const otherRestaurantId = await createRestaurant();
+    const table = await createTable(otherRestaurantId, 1);
+    const order = await createOrder(otherRestaurantId, table.id);
+    const manager = await createStaff(restaurantId, 'manager');
+
+    const res = await request(app).get(`/v1/restaurants/${restaurantId}/orders/${order.id}`).set('Authorization', `Bearer ${manager.token}`);
+    expect(res.status).toBe(404);
   });
 });

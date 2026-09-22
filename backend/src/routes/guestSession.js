@@ -1,24 +1,24 @@
 import { Router } from 'express';
 import crypto from 'node:crypto';
+import { z } from 'zod';
 
 import { pool } from '../db.js';
 import { generateGuestToken } from '../auth.js';
 import { authenticateGuest } from '../middleware/authGuest.js';
+import { validate } from '../middleware/validate.js';
 import { distanceMeters } from '../geo.js';
 import * as billModel from '../models/billModel.js';
+import * as orderModel from '../models/orderModel.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 
-function validateScanInput(body) {
-  const errors = [];
-  if (typeof body.latitude !== 'number' || Number.isNaN(body.latitude) || body.latitude < -90 || body.latitude > 90) {
-    errors.push({ field: 'latitude', reason: 'must be a number between -90 and 90' });
-  }
-  if (typeof body.longitude !== 'number' || Number.isNaN(body.longitude) || body.longitude < -180 || body.longitude > 180) {
-    errors.push({ field: 'longitude', reason: 'must be a number between -180 and 180' });
-  }
-  return errors;
-}
+// Shared by scan and heartbeat — both are "prove where you are right
+// now" requests with the identical shape.
+const coordinatesSchema = z.object({
+  latitude: z.number().gte(-90, 'must be a number between -90 and 90').lte(90, 'must be a number between -90 and 90'),
+  longitude: z.number().gte(-180, 'must be a number between -180 and 180').lte(180, 'must be a number between -180 and 180'),
+});
 
 // ---------------------------------------------------------------------
 // POST /tables/:qrCodeId/scan — the entry point of the entire guest
@@ -27,22 +27,15 @@ function validateScanInput(body) {
 // point, that's exactly what this route creates. The gate here is
 // proximity, not a role.
 // ---------------------------------------------------------------------
-router.post('/tables/:qrCodeId/scan', async (req, res) => {
-  const errors = validateScanInput(req.body ?? {});
-  if (errors.length > 0) {
-    return res.status(400).json({
-      error: { code: 'INVALID_REQUEST', message: 'One or more fields are invalid', details: errors },
-    });
-  }
-
+router.post('/tables/:qrCodeId/scan', validate(coordinatesSchema), async (req, res) => {
   const { latitude, longitude } = req.body;
   const { qrCodeId } = req.params;
 
   try {
     const tableResult = await pool.query(
-      `SELECT t.id AS table_id, t.restaurant_id, t.is_active AS table_active,
+      `SELECT t.id AS table_id, t.restaurant_id, t.is_active AS table_active, t.qr_rotated_at,
               r.name AS restaurant_name, r.latitude AS restaurant_lat,
-              r.longitude AS restaurant_lon, r.max_guest_distance_meters
+              r.longitude AS restaurant_lon, r.max_guest_distance_meters, r.qr_max_age_days
        FROM tables t
        JOIN restaurants r ON r.id = t.restaurant_id
        WHERE t.qr_code_unique_id = $1`,
@@ -55,6 +48,22 @@ router.post('/tables/:qrCodeId/scan', async (req, res) => {
     }
     if (!table.table_active) {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'This table is not currently active' } });
+    }
+
+    // Opt-in per-restaurant policy (migration 016) — off by default
+    // (qr_max_age_days NULL), so this only ever rejects a restaurant
+    // that explicitly configured a max age for its printed QR codes.
+    // The unconditional fix for a leaked code — rotating it outright,
+    // POST /v1/qr/:restaurantId/:tableNumber/rotate — doesn't depend on
+    // this at all.
+    if (table.qr_max_age_days !== null) {
+      const ageMs = Date.now() - new Date(table.qr_rotated_at).getTime();
+      const maxAgeMs = table.qr_max_age_days * 24 * 60 * 60 * 1000;
+      if (ageMs > maxAgeMs) {
+        return res.status(403).json({
+          error: { code: 'FORBIDDEN', message: 'This QR code has expired — please ask staff for a new one' },
+        });
+      }
     }
 
     // Fail closed: a restaurant that hasn't set its location yet can't
@@ -121,7 +130,7 @@ router.post('/tables/:qrCodeId/scan', async (req, res) => {
       distance_meters: Math.round(distance * 10) / 10,
     });
   } catch (err) {
-    console.error('POST /tables/:qrCodeId/scan: failed:', err.message);
+    logger.error(`POST /tables/:qrCodeId/scan: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to start guest session' } });
   }
 });
@@ -138,14 +147,7 @@ router.post('/tables/:qrCodeId/scan', async (req, res) => {
 // Deliberately does NOT extend expires_at — this only re-verifies an
 // existing session's location, it isn't a renewal mechanism.
 // ---------------------------------------------------------------------
-router.post('/guest/session/heartbeat', authenticateGuest, async (req, res) => {
-  const errors = validateScanInput(req.body ?? {});
-  if (errors.length > 0) {
-    return res.status(400).json({
-      error: { code: 'INVALID_REQUEST', message: 'One or more fields are invalid', details: errors },
-    });
-  }
-
+router.post('/guest/session/heartbeat', authenticateGuest, validate(coordinatesSchema), async (req, res) => {
   const { latitude, longitude } = req.body;
 
   try {
@@ -202,7 +204,7 @@ router.post('/guest/session/heartbeat', authenticateGuest, async (req, res) => {
 
     res.json({ ok: true, distance_meters: Math.round(distance * 10) / 10 });
   } catch (err) {
-    console.error('POST /guest/session/heartbeat: failed:', err.message);
+    logger.error(`POST /guest/session/heartbeat: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to verify session' } });
   }
 });
@@ -238,14 +240,42 @@ router.get('/guest/session', authenticateGuest, async (req, res) => {
     ]);
 
     const staff = staffResult.rows[0];
+    // Repeat-guest recognition — only meaningful once this session is
+    // linked to a guest_profile (i.e. after their first order); a brand
+    // new session that hasn't ordered yet has nothing to look up.
+    const visitCount = req.guestSession.guest_profile_id
+      ? await billModel.countVisits(req.guestSession.guest_profile_id, req.guestSession.sitting_id)
+      : 0;
+
     res.json({
       session: req.guestSession,
       ...sessionResult.rows[0],
       server: staff ? { name: staff.display_name ?? staff.name, role: staff.role } : null,
+      is_returning_guest: visitCount > 0,
+      visit_count: visitCount,
     });
   } catch (err) {
-    console.error('GET /guest/session: failed:', err.message);
+    logger.error(`GET /guest/session: failed: ${err.message}`);
     res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load session' } });
+  }
+});
+
+// ---------------------------------------------------------------------
+// GET /guest/session/history — past orders at this restaurant, for this
+// guest_profile (per-restaurant, not cross-restaurant — see
+// SNAPORDER_STATUS.md). Empty (not an error) for a session with no
+// linked guest_profile yet — nothing to look up, not a failure.
+// ---------------------------------------------------------------------
+router.get('/guest/session/history', authenticateGuest, async (req, res) => {
+  if (!req.guestSession.guest_profile_id) {
+    return res.json({ data: [] });
+  }
+  try {
+    const orders = await orderModel.findOrderHistoryForGuestProfile(req.guestSession.guest_profile_id);
+    res.json({ data: orders });
+  } catch (err) {
+    logger.error(`GET /guest/session/history: failed: ${err.message}`);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load order history' } });
   }
 });
 

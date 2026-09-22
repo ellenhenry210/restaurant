@@ -27,4 +27,11 @@ router.get(
   analyticsController.getDaily
 );
 
+router.get(
+  '/:id/analytics/revenue',
+  authenticate,
+  authorize('view_restaurant_analytics', { restaurantIdParam: 'id' }),
+  analyticsController.getRevenue
+);
+
 export default router;
